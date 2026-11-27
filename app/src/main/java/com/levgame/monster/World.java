@@ -38,6 +38,24 @@ public final class World {
     private static final float CAR_WHEEL_BREAK_ENERGY = 35_000f;
     private static final float TRUCK_WHEEL_BREAK_ENERGY = 165_000f;
     private static final int LOOSE_WHEEL_LIFETIME = 14 * 120;
+    static final float TRUCK_WHEEL_X = 1.35f;
+    static final float TRUCK_WHEEL_Y = .78f;
+    static final float TRUCK_WHEEL_Z = 1.55f;
+    static final float TRUCK_WHEEL_RADIUS = .78f;
+    static final float TRUCK_WHEEL_HALF_WIDTH = .42f;
+    static final float CAR_WHEEL_X = .78f;
+    static final float CAR_WHEEL_Y = .35f;
+    static final float CAR_WHEEL_Z = 1.29f;
+    static final float CAR_WHEEL_RADIUS = .35f;
+    static final float CAR_WHEEL_HALF_WIDTH = .13f;
+    static final float WHEEL_DENT_DROP = .18f;
+    private static final float TRUCK_HALF_WIDTH = TRUCK_WHEEL_X + TRUCK_WHEEL_HALF_WIDTH;
+    private static final float TRUCK_HALF_LENGTH = 2.46f;
+    private static final float TRUCK_CHASSIS_BOTTOM = .59f;
+    private static final float TRUCK_ROOF_HEIGHT = 2.66f;
+    private static final float TRUCK_ROOF_HALF_WIDTH = .99f;
+    private static final float TRUCK_ROOF_HALF_LENGTH = 1.98f;
+    private static final float TIP_ANGLE = .79f;
     private static final int[] DX = {0, 1, 0, -1};
     private static final int[] DZ = {1, 0, -1, 0};
     // min X, min Z (toe), max X, max Z (lip), lip height. Both rise toward +Z.
@@ -55,21 +73,25 @@ public final class World {
 
     public static final class Body {
         public float x, y, z, yaw, vx, vz;
-        public float pitch, roll, wheelSpin;
+        /** Radians; local +Z is forward. Negative pitch raises the nose; positive roll lowers the left side. */
+        public float pitch, roll;
+        public float wheelSpin;
         public float damage, dentFront, dentBack, dentLeft, dentRight;
         public float health;
         public final float maxHealth;
         public int color;
         /** Bits 0 through 3: left rear, left front, right rear, right front. */
         public int detachedWheels;
+        /** Attached tires supporting the truck this tick, in detachedWheels bit order. */
+        public int groundedWheels;
         public boolean visible;
 
         private final float halfWidth, halfLength, invMass, invInertia, radius;
-        private float spin, verticalSpeed, stun, cruise;
+        private float spin, verticalSpeed, rollSpeed, supportHeight, stun, cruise;
         private int blockedTicks;
         private int gx, gz, direction, nextDirection, curveSample;
         private int reserved = -1;
-        private boolean crossing, flattened, grounded, parked;
+        private boolean crossing, flattened, grounded, parked, overturned, truckContact;
 
         private Body(float halfWidth, float halfLength, float mass, float maxHealth) {
             this.halfWidth = halfWidth;
@@ -88,6 +110,7 @@ public final class World {
 
         private float vx, vy, vz, yawRate, spinRate, tiltRate;
         private int age;
+        private boolean fromPlayer;
 
         private LooseWheel() {}
     }
@@ -126,7 +149,7 @@ public final class World {
         final List<Tree> fallenView = Collections.unmodifiableList(fallen);
     }
 
-    public final Body player = new Body(1.55f, 2.6f, TRUCK_MASS, TRUCK_MAX_HEALTH);
+    public final Body player = new Body(TRUCK_HALF_WIDTH, TRUCK_HALF_LENGTH, TRUCK_MASS, TRUCK_MAX_HEALTH);
     public final Body[] traffic = new Body[112];
     public final LooseWheel[] looseWheels = new LooseWheel[64];
     public int crushed;
@@ -142,6 +165,9 @@ public final class World {
 
     // Scratch state for the separating-axis test. The simulation is single-threaded.
     private float normalX, normalZ, overlap;
+    private final float[] truckSurfaces = new float[4];
+    private final float[] truckWheelFloors = new float[4];
+    private final Body[] truckSupports = new Body[4];
 
     public World() {
         for (int i = 0; i < traffic.length; i++) {
@@ -252,6 +278,7 @@ public final class World {
         player.z = SPAWN_Z;
         player.yaw = SPAWN_YAW;
         player.visible = true;
+        player.groundedWheels = 15;
         for (int i = 0; i < TARGETS.length; i++) {
             Body car = traffic[i];
             car.x = TARGETS[i][0];
@@ -267,14 +294,39 @@ public final class World {
 
     private static void clear(Body b) {
         b.x = b.y = b.z = b.vx = b.vz = b.yaw = 0f;
-        b.pitch = b.roll = b.wheelSpin = b.spin = b.verticalSpeed = b.stun = b.cruise = 0f;
+        b.pitch = b.roll = b.wheelSpin = b.spin = b.verticalSpeed = b.rollSpeed = 0f;
+        b.supportHeight = b.stun = b.cruise = 0f;
         b.damage = b.dentFront = b.dentBack = b.dentLeft = b.dentRight = 0f;
         b.health = b.maxHealth;
-        b.detachedWheels = 0;
+        b.detachedWheels = b.groundedWheels = 0;
         b.color = b.gx = b.gz = b.direction = b.nextDirection = b.curveSample = b.blockedTicks = 0;
         b.reserved = -1;
-        b.visible = b.crossing = b.flattened = b.parked = false;
+        b.visible = b.crossing = b.flattened = b.parked = b.overturned = b.truckContact = false;
         b.grounded = true;
+    }
+
+    /** Restore the truck's health, panels and wheels at its current position and orientation. */
+    public void repairPlayer() {
+        player.health = player.maxHealth;
+        player.damage = player.dentFront = player.dentBack = player.dentLeft = player.dentRight = 0f;
+        player.detachedWheels = 0;
+        for (LooseWheel wheel : looseWheels) if (wheel.fromPlayer) wheel.visible = false;
+        sampleTruckSurfaces();
+        float floor = truckFloor();
+        player.y = player.grounded ? floor : Math.max(player.y, floor);
+        updateGroundedWheels();
+    }
+
+    /** Set the truck upright in place, retaining its heading, damage and detached wheels. */
+    public void rightPlayer() {
+        player.pitch = player.roll = player.rollSpeed = player.verticalSpeed = player.spin = 0f;
+        player.vx = player.vz = 0f;
+        player.overturned = false;
+        sampleTruckSurfaces();
+        player.y = truckFloor();
+        player.supportHeight = meanTruckSurface();
+        player.grounded = true;
+        updateGroundedWheels();
     }
 
     /** Positive steer turns right; negative throttle reverses. */
@@ -291,36 +343,42 @@ public final class World {
     }
 
     private void tick(float steer, float throttle, float brake) {
-        boolean driveable = player.health > 0f;
+        boolean driveable = player.health > 0f && !player.overturned;
         if (!driveable) steer = throttle = brake = 0f;
         float speed = forwardSpeed(player);
-        float grip = player.grounded ? 1f : 0.12f;
-        float steerRate = steer * clamp(speed * 0.22f, -1.35f, 1.65f);
-        player.yaw = wrap(player.yaw + steerRate * grip * TICK);
-        float deceleration = driveable ? brake * 23f : 5f;
-        drive(player, throttle * grip * (throttle >= 0f ? 15f : 9f), deceleration * grip, grip * 7f, 43f, 12f);
+        int missing = Integer.bitCount(player.detachedWheels & 15);
+        int front = 2 - Integer.bitCount(player.detachedWheels & 10);
+        float traction = player.grounded && !player.overturned && missing < 4 ? 1f - missing * .20f : 0f;
+        float steeringGrip = traction * (.21f + .395f * front);
+        float steerRate = steer * clamp(speed * .22f, -1.35f, 1.65f) * steeringGrip;
+        int imbalance = Integer.bitCount(player.detachedWheels & 12) - Integer.bitCount(player.detachedWheels & 3);
+        steerRate += .037f * imbalance * speed * traction;
+        player.yaw = wrap(player.yaw + steerRate * TICK);
+        float drag = player.grounded ? missing * 1.05f : 0f;
+        if (player.overturned && player.grounded) drag = 12f;
+        float deceleration = brake * 23f * traction;
+        if (!driveable && player.grounded) deceleration = 5f;
+        drive(player, throttle * traction * (throttle >= 0f ? 15f : 9f), deceleration + drag,
+                .12f + traction * 6.88f + (player.overturned && player.grounded ? 4f : 0f), 43f, 12f);
 
         for (Body car : traffic) if (car.visible) driveTraffic(car);
-        float oldX = player.x, oldZ = player.z, oldHeight = player.y, oldVertical = player.verticalSpeed;
-        move(player);
-        float slope = rampMotion(oldX, oldZ);
-        float pitch = (float) -Math.atan(slope * cos(player.yaw)) - throttle * 0.05f
-                + brake * 0.10f - player.verticalSpeed * 0.025f;
-        player.pitch += (clamp(pitch, -0.4f, 0.4f) - player.pitch) * 8f * TICK;
-        float roll = (float) -Math.atan(slope * sin(player.yaw)) - steerRate * speed * 0.004f;
-        player.roll += (clamp(roll, -0.4f, 0.4f) - player.roll) * 8f * TICK;
-        float landingSpeed = oldHeight >= 0.85f && player.y < 0.85f ? Math.max(0f, -oldVertical) : 0f;
         for (Body car : traffic) if (car.visible) move(car);
+        float oldX = player.x, oldZ = player.z;
+        move(player);
+        blockRampWalls(oldX, oldZ);
+        truckRide(steerRate * speed, throttle * traction, brake * traction);
 
         // At the speed cap a vehicle moves less than half a metre per tick,
         // smaller than a car's half-width and the thinnest static collider.
         for (int i = 0; i < traffic.length; i++) {
             Body car = traffic[i];
             if (!car.visible) continue;
-            if (player.y < 0.85f) collide(player, car, landingSpeed);
+            if (player.y < carHeight(car) + .25f && !car.truckContact && !canClimb(car)) {
+                collide(player, car);
+            }
             for (int j = i + 1; j < traffic.length; j++) {
                 Body other = traffic[j];
-                if (other.visible) collide(car, other, 0f);
+                if (other.visible) collide(car, other);
             }
         }
         scenery(player);
@@ -334,47 +392,240 @@ public final class World {
         }
     }
 
-    private float rampMotion(float oldX, float oldZ) {
+    private void blockRampWalls(float oldX, float oldZ) {
         float oldSurface = rampHeight(oldX, oldZ);
         float surface = rampHeight(player.x, player.z);
-        float slope = 0f;
         for (float[] ramp : RAMPS) {
             if (player.x < ramp[0] || player.x > ramp[2] || player.z < ramp[1] || player.z > ramp[3]) continue;
             // A tall side or the lip blocks entry from below; the toe is flush with the ground.
-            if (surface > player.y + 0.25f && surface > oldSurface + 0.25f) {
+            if (surface > player.y + .40f && surface > oldSurface + .40f) {
                 float f = sin(player.yaw), c = cos(player.yaw);
                 if (oldZ > ramp[3]) wall(player, 0f, -1f, ramp[3] - player.z + 0.001f, f, c);
                 else if (oldX < ramp[0]) wall(player, 1f, 0f, player.x - ramp[0] + 0.001f, f, c);
                 else if (oldX > ramp[2]) wall(player, -1f, 0f, ramp[2] - player.x + 0.001f, f, c);
-                surface = rampHeight(player.x, player.z);
-            } else {
-                slope = rampSlope(ramp);
             }
             break;
         }
-        if (player.grounded && oldSurface > surface + 0.25f) {
-            player.grounded = false;
-            player.verticalSpeed = Math.max(0f, player.verticalSpeed);
+    }
+
+    private boolean canClimb(Body car) {
+        if (player.overturned) return false;
+        float f = sin(player.yaw), c = cos(player.yaw);
+        float dx = car.x - player.x, dz = car.z - player.z;
+        float side = Math.abs(dx * c - dz * f), along = Math.abs(dx * f + dz * c);
+        // One tire can climb a corner, but a broadside remains a horizontal collision.
+        return side < 1.85f && (along > .62f * side || car.flattened);
+    }
+
+    private static float carHeight(Body car) {
+        return car.flattened ? .62f : 1.36f - .27f * car.damage;
+    }
+
+    private void sampleTruckSurfaces() {
+        float f = sin(player.yaw), c = cos(player.yaw);
+        for (int i = 0; i < 4; i++) {
+            float x = i < 2 ? -TRUCK_WHEEL_X : TRUCK_WHEEL_X;
+            float z = (i & 1) == 0 ? -TRUCK_WHEEL_Z : TRUCK_WHEEL_Z;
+            float surface = rampHeight(player.x + c * x + f * z, player.z - f * x + c * z);
+            // A tire reaching over a tall ramp wall cannot pull the truck onto the ramp.
+            float cornerHeight = player.y + sin(player.roll) * x - sin(player.pitch) * z;
+            truckSurfaces[i] = surface <= cornerHeight + .65f ? surface : 0f;
+            truckSupports[i] = null;
         }
-        if (!player.grounded) {
-            player.y += player.verticalSpeed * TICK;
-            player.verticalSpeed -= GRAVITY * TICK;
-            if (player.y <= surface) {
-                float closing = slope * player.vz - player.verticalSpeed;
-                // The suspension absorbs ordinary ramp and car-climb landings.
-                if (closing > SAFE_LANDING_SPEED) {
-                    float excessEnergy = 0.5f * (closing * closing - SAFE_LANDING_SPEED * SAFE_LANDING_SPEED)
-                            / player.invMass;
-                    impactHealth(player, excessEnergy);
+        for (Body car : traffic) {
+            if (!car.visible || distanceSq(player.x, player.z, car.x, car.z) > 36f
+                    || (!car.truckContact && !canClimb(car) && player.y < carHeight(car))) continue;
+            float bf = sin(car.yaw), bc = cos(car.yaw);
+            float height = carHeight(car);
+            for (int i = 0; i < 4; i++) {
+                float x = i < 2 ? -TRUCK_WHEEL_X : TRUCK_WHEEL_X;
+                float z = (i & 1) == 0 ? -TRUCK_WHEEL_Z : TRUCK_WHEEL_Z;
+                float dx = player.x - car.x + c * x + f * z;
+                float dz = player.z - car.z - f * x + c * z;
+                float side = Math.abs(dx * bc - dz * bf);
+                float end = Math.abs(dx * bf + dz * bc);
+                // A tire meets the sloped hood or fender first; roof support rises farther inboard.
+                float across = clamp((car.halfWidth + .75f - side) / .51f, 0f, 1f);
+                float along = clamp((car.halfLength + .70f - end) / 1.06f, 0f, 1f);
+                float rise = Math.min(across, along);
+                float surface = car.y + height * rise * rise * (3f - 2f * rise);
+                if (surface > truckSurfaces[i]) {
+                    truckSurfaces[i] = surface;
+                    truckSupports[i] = car;
                 }
-                player.grounded = true;
             }
         }
-        if (player.grounded) {
-            player.y = surface;
-            player.verticalSpeed = slope * player.vz;
+    }
+
+    private void truckRide(float lateralAcceleration, float throttle, float brake) {
+        sampleTruckSurfaces();
+        float rearLeft = loadedSurface(0), frontLeft = loadedSurface(1);
+        float rearRight = loadedSurface(2), frontRight = loadedSurface(3);
+        float pitchTarget = (float) -Math.atan((frontLeft + frontRight - rearLeft - rearRight)
+                / (4f * TRUCK_WHEEL_Z)) - .047f * throttle + .085f * brake;
+        float rollTarget = (float) Math.atan((rearRight + frontRight - rearLeft - frontLeft)
+                / (4f * TRUCK_WHEEL_X));
+        float driveLean = lateralAcceleration * .020f;
+        if (!player.overturned && (Math.abs(player.roll) > TIP_ANGLE
+                || (player.grounded && Math.abs(driveLean + rollTarget) > TIP_ANGLE))) {
+            player.overturned = true;
+            if (Math.abs(player.rollSpeed) < 1.4f) {
+                float tip = Math.abs(player.roll) > TIP_ANGLE ? player.roll : driveLean + rollTarget;
+                player.rollSpeed = Math.copySign(1.4f, tip);
+            }
         }
-        return player.grounded ? slope : 0f;
+        if (player.overturned) {
+            float rest = Math.copySign(Math.abs(player.roll) < 2.42f && Math.abs(player.rollSpeed) < 2.1f
+                    ? PI * .5f : PI, player.roll == 0f ? player.rollSpeed : player.roll);
+            float torque = wrap(rest - player.roll) * 15f;
+            player.rollSpeed += (torque - player.rollSpeed * (player.grounded ? 4.5f : .55f)) * TICK;
+            pitchTarget = 0f;
+        } else if (player.grounded) {
+            float torque = (clamp(rollTarget + driveLean, -.67f, .67f) - player.roll) * 42f;
+            player.rollSpeed += (torque - player.rollSpeed * 8f) * TICK;
+        } else {
+            player.rollSpeed *= 1f - .5f * TICK;
+            pitchTarget = -.10f - .015f * player.verticalSpeed;
+        }
+        player.roll = wrap(player.roll + clamp(player.rollSpeed, -8f, 8f) * TICK);
+        player.pitch += (clamp(pitchTarget, -.53f, .53f) - player.pitch) * 11f * TICK;
+
+        float floor = truckFloor();
+        boolean wasGrounded = player.grounded;
+        float support = meanTruckSurface();
+        float surfaceSpeed = clamp((support - player.supportHeight) / TICK, -10f, 10f);
+        for (Body car : truckSupports) {
+            if (car == null) continue;
+            surfaceSpeed = clamp(surfaceSpeed, -1.2f, .8f);
+            break;
+        }
+        player.supportHeight = support;
+        float fallSpeed = player.verticalSpeed - GRAVITY * TICK;
+        float nextY = player.y + fallSpeed * TICK;
+        // Suspension changes the mesh origin, but only motion of the supporting surface
+        // contributes a launch velocity. In particular a rolling truck cannot kick itself up.
+        player.grounded = nextY <= floor || (wasGrounded && player.y - floor < .10f
+                && (surfaceSpeed > -4f || player.overturned));
+        float closing = player.grounded ? Math.max(0f, surfaceSpeed - fallSpeed) : 0f;
+        if (player.grounded) {
+            if (!wasGrounded && closing > SAFE_LANDING_SPEED) truckLanding(closing);
+            player.verticalSpeed = player.overturned ? 0f : .4f * player.verticalSpeed + .6f * surfaceSpeed;
+            player.y = floor;
+        } else {
+            player.y = nextY;
+            player.verticalSpeed = wasGrounded ? Math.max(0f, fallSpeed) : fallSpeed;
+        }
+        updateGroundedWheels();
+        loadCars(wasGrounded ? 0f : closing);
+    }
+
+    private float loadedSurface(int index) {
+        return truckSurfaces[index] - ((player.detachedWheels & (1 << index)) == 0 ? 0f : .49f);
+    }
+
+    private float meanTruckSurface() {
+        return (truckSurfaces[0] + truckSurfaces[1] + truckSurfaces[2] + truckSurfaces[3]) * .25f;
+    }
+
+    private float truckFloor() {
+        float sr = sin(player.roll), cr = cos(player.roll);
+        float sp = sin(player.pitch), cp = cos(player.pitch);
+        // Vertical coefficients of the renderer's Rx(pitch) * Rz(roll) transform.
+        float x = cp * sr, y = cp * cr, z = -sp;
+        float tire = TRUCK_WHEEL_RADIUS * length(y, z) + TRUCK_WHEEL_HALF_WIDTH * Math.abs(x);
+        float floor = Float.NEGATIVE_INFINITY;
+        for (int i = 0; i < 4; i++) {
+            float side = i < 2 ? -1f : 1f, axle = (i & 1) == 0 ? -1f : 1f;
+            float sideDent = side < 0f ? player.dentLeft : player.dentRight;
+            float endDent = axle < 0f ? player.dentBack : player.dentFront;
+            float corner = x * side * (TRUCK_WHEEL_X - .14f * sideDent)
+                    + z * axle * (TRUCK_WHEEL_Z - .20f * endDent);
+            boolean attached = (player.detachedWheels & (1 << i)) == 0;
+            float support = attached ? y * (TRUCK_WHEEL_Y - WHEEL_DENT_DROP * player.damage) - tire
+                    : y * TRUCK_CHASSIS_BOTTOM;
+            truckWheelFloors[i] = truckSurfaces[i] - corner - support;
+            floor = Math.max(floor, truckWheelFloors[i]);
+        }
+        float centre = rampHeight(player.x, player.z);
+        float frame = centre - y * (y >= 0f ? TRUCK_CHASSIS_BOTTOM : 1.72f)
+                + Math.abs(x) * 1.36f + Math.abs(z) * 2.28f;
+        float roof = centre - y * (TRUCK_ROOF_HEIGHT - .16f * player.damage)
+                + Math.abs(x) * TRUCK_ROOF_HALF_WIDTH + Math.abs(z) * TRUCK_ROOF_HALF_LENGTH;
+        return Math.max(floor, Math.max(frame, roof));
+    }
+
+    private void updateGroundedWheels() {
+        player.groundedWheels = 0;
+        if (!player.grounded || player.overturned) return;
+        for (int i = 0; i < 4; i++) {
+            int bit = 1 << i;
+            if ((player.detachedWheels & bit) == 0 && player.y - truckWheelFloors[i] <= .25f) {
+                player.groundedWheels |= bit;
+            }
+        }
+    }
+
+    private void truckLanding(float closing) {
+        float energy = .5f * (closing * closing - SAFE_LANDING_SPEED * SAFE_LANDING_SPEED) / player.invMass;
+        impactHealth(player, energy);
+        int corner = 0;
+        for (int i = 1; i < 4; i++) if (truckSurfaces[i] > truckSurfaces[corner]) corner = i;
+        float side = corner < 2 ? -1f : 1f, axle = (corner & 1) == 0 ? -1f : 1f;
+        float f = sin(player.yaw), c = cos(player.yaw);
+        float x = c * side * TRUCK_WHEEL_X + f * axle * TRUCK_WHEEL_Z;
+        float z = -f * side * TRUCK_WHEEL_X + c * axle * TRUCK_WHEEL_Z;
+        dent(player, x, z, energy, 2.6e-6f);
+        breakWheels(player, x, z, c * side, -f * side, energy);
+        player.rollSpeed += side * clamp((closing - SAFE_LANDING_SPEED) * .40f, 0f, 3.2f);
+    }
+
+    private void loadCars(float landingSpeed) {
+        for (Body car : traffic) {
+            if (!car.visible || distanceSq(player.x, player.z, car.x, car.z) > 25f) {
+                car.truckContact = false;
+                continue;
+            }
+            float load = 0f;
+            if (player.grounded) {
+                for (int i = 0; i < 4; i++) {
+                    if (truckSupports[i] == car && player.y - truckWheelFloors[i] <= .25f) {
+                        load = Math.max(load, truckSurfaces[i] - car.y);
+                    }
+                }
+            }
+            if (load > .14f && !car.truckContact) {
+                // Transfer momentum at first contact; the tires then roll up the car instead of
+                // receiving a scripted vertical kick or repeatedly pushing the shell ahead.
+                float vx = player.vx - car.vx, vz = player.vz - car.vz;
+                float exchange = .37f / (player.invMass + car.invMass);
+                float energy = .27f * (vx * vx + vz * vz) / (player.invMass + car.invMass);
+                impulse(player, -vx * exchange, -vz * exchange, 0f, 0f);
+                impulse(car, vx * exchange, vz * exchange, 0f, 0f);
+                impactHealth(player, energy);
+                if (!car.flattened) {
+                    float f = sin(car.yaw), c = cos(car.yaw);
+                    float end = (player.x - car.x) * f + (player.z - car.z) * c;
+                    float sign = Math.copySign(1f, end);
+                    dent(car, sign * f * car.halfLength, sign * c * car.halfLength, energy, 7e-6f);
+                    breakWheels(car, sign * f * car.halfLength, sign * c * car.halfLength,
+                            f * sign, c * sign, energy);
+                }
+            }
+            car.truckContact |= load > .14f;
+            if (!car.flattened && (load > .52f || (load > .16f && landingSpeed > 3.5f))) crush(car);
+        }
+    }
+
+    private void crush(Body car) {
+        car.flattened = true;
+        car.health = 0f;
+        crushed++;
+        car.damage = 1f;
+        car.dentFront = Math.max(car.dentFront, .64f);
+        car.dentBack = Math.max(car.dentBack, .64f);
+        car.dentLeft = Math.max(car.dentLeft, .64f);
+        car.dentRight = Math.max(car.dentRight, .64f);
+        release(car);
     }
 
     private void driveTraffic(Body car) {
@@ -606,11 +857,11 @@ public final class World {
                 / (body.halfWidth > 1f ? 0.8f : 0.36f));
     }
 
-    private void collide(Body a, Body b, float landingSpeed) {
+    private void collide(Body a, Body b) {
         float dx = b.x - a.x, dz = b.z - a.z;
         float range = a.radius + b.radius;
         if (dx * dx + dz * dz > range * range) return;
-        collide(a, b, b.x, b.z, sin(b.yaw), cos(b.yaw), b.halfWidth, b.halfLength, landingSpeed);
+        collide(a, b, b.x, b.z, sin(b.yaw), cos(b.yaw), b.halfWidth, b.halfLength);
     }
 
     private void scenery(Body body) {
@@ -622,7 +873,7 @@ public final class World {
             for (float[] b : BUILDINGS[gz * (GRID - 1) + gx]) {
                 if (Math.abs(b[0] - body.x) <= b[2] + body.radius
                         && Math.abs(b[1] - body.z) <= b[3] + body.radius) {
-                    collide(body, null, b[0], b[1], 0f, 1f, b[2], b[3], 0f);
+                    collide(body, null, b[0], b[1], 0f, 1f, b[2], b[3]);
                 }
             }
         }
@@ -782,7 +1033,7 @@ public final class World {
         normalZ = nz;
         overlap = depth;
         resolve(a, null, a.x + nx * extent + nz * tangent,
-                a.z + nz * extent - nx * tangent, 0f);
+                a.z + nz * extent - nx * tangent);
         // Only positional correction keeps the entire footprint inside the map.
         float remainder = depth - correction(depth);
         a.x -= nx * remainder;
@@ -790,7 +1041,7 @@ public final class World {
     }
 
     private void collide(Body a, Body b, float bx, float bz, float bf, float bc,
-                         float bw, float bl, float landingSpeed) {
+                          float bw, float bl) {
         float af = sin(a.yaw), ac = cos(a.yaw);
         float dx = bx - a.x, dz = bz - a.z;
         overlap = Float.POSITIVE_INFINITY;
@@ -810,7 +1061,7 @@ public final class World {
         float tangent = (low + high) * 0.5f;
         float depth = projection(nx, nz, af, ac, a.halfWidth, a.halfLength) - overlap * 0.5f;
         resolve(a, b, a.x + nx * depth + nz * tangent,
-                 a.z + nz * depth - nx * tangent, landingSpeed);
+                  a.z + nz * depth - nx * tangent);
     }
 
     private boolean axis(float nx, float nz, float dx, float dz, float af, float ac,
@@ -844,7 +1095,7 @@ public final class World {
         return 0f;
     }
 
-    private void resolve(Body a, Body b, float x, float z, float landingSpeed) {
+    private void resolve(Body a, Body b, float x, float z) {
         float nx = normalX, nz = normalZ;
         float ax = x - a.x, az = z - a.z;
         float bx = b == null ? 0f : x - b.x, bz = b == null ? 0f : z - b.z;
@@ -862,6 +1113,11 @@ public final class World {
             float normalImpulse = (1f + restitution) * closing / invEffective;
             impulse(a, -nx * normalImpulse, -nz * normalImpulse, ax, az);
             if (b != null) impulse(b, nx * normalImpulse, nz * normalImpulse, bx, bz);
+            if (a == player) {
+                // A low strike acting below the centre of mass can trip the truck sideways.
+                float side = nx * cos(a.yaw) - nz * sin(a.yaw);
+                a.rollSpeed -= side * normalImpulse * a.invMass * (b == null ? .63f : .44f);
+            }
 
             float tx = nz, tz = -nx;
             float at = az * tx - ax * tz, bt = bz * tx - bx * tz;
@@ -885,30 +1141,8 @@ public final class World {
             }
         }
 
-        float landingEnergy = 0.5f * landingSpeed * landingSpeed / a.invMass;
-        breakWheels(a, ax, az, nx, nz, Math.max(energy, landingEnergy));
-        if (b != null) breakWheels(b, bx, bz, -nx, -nz, Math.max(energy, landingEnergy));
-
-        if (a == player && b != null) {
-            float noseAlignment = nx * sin(a.yaw) + nz * cos(a.yaw);
-            boolean climb = closing > 7.5f && Math.abs(noseAlignment) > 0.63f;
-            if ((landingSpeed > 0f || climb) && !b.flattened) {
-                b.flattened = true;
-                b.health = 0f;
-                crushed++;
-                b.damage = Math.max(b.damage, 0.76f);
-                b.dentFront = Math.max(b.dentFront, 0.52f);
-                b.dentBack = Math.max(b.dentBack, 0.52f);
-                b.dentLeft = Math.max(b.dentLeft, 0.52f);
-                b.dentRight = Math.max(b.dentRight, 0.52f);
-                release(b);
-                if (climb && a.grounded && a.y == 0f) {
-                    a.y = 0.025f;
-                    a.grounded = false;
-                    a.verticalSpeed = clamp(4f + closing * 0.14f, 5.3f, 7.4f);
-                }
-            }
-        }
+        breakWheels(a, ax, az, nx, nz, energy);
+        if (b != null) breakWheels(b, bx, bz, -nx, -nz, energy);
 
         float correction = correction(overlap) / (a.invMass + invB);
         a.x -= nx * correction * a.invMass;
@@ -975,6 +1209,7 @@ public final class World {
         int bit = 1 << index;
         if ((body.detachedWheels & bit) != 0) return;
         body.detachedWheels |= bit;
+        body.groundedWheels &= ~bit;
         if (body != player) release(body);
 
         LooseWheel wheel = looseWheels[nextLooseWheel];
@@ -986,20 +1221,20 @@ public final class World {
         float bend = side < 0f ? body.dentLeft : body.dentRight;
         float endDent = axle > 0f ? body.dentFront : body.dentBack;
         // Match the attached wheel's centre, including the chassis roll and pitch.
-        float mountX = side * ((truck ? 1.54f : 0.86f) - 0.14f * bend);
-        float mountY = (truck ? 0.92f : 0.35f) - 0.18f * body.damage;
-        float mountZ = axle * ((truck ? 1.69f : 1.29f) - 0.20f * endDent);
+        float mountX = side * ((truck ? TRUCK_WHEEL_X : CAR_WHEEL_X) - .14f * bend);
+        float mountY = (truck ? TRUCK_WHEEL_Y : CAR_WHEEL_Y) - WHEEL_DENT_DROP * body.damage;
+        float mountZ = axle * ((truck ? TRUCK_WHEEL_Z : CAR_WHEEL_Z) - .20f * endDent);
         float rollX = cos(body.roll) * mountX - sin(body.roll) * mountY;
         float rollY = sin(body.roll) * mountX + cos(body.roll) * mountY;
         float pitchZ = sin(body.pitch) * rollY + cos(body.pitch) * mountZ;
         float f = sin(body.yaw), c = cos(body.yaw);
         float rx = c * rollX + f * pitchZ, rz = -f * rollX + c * pitchZ;
 
-        wheel.radius = truck ? 0.91f : 0.35f;
-        wheel.halfWidth = truck ? 0.48f : 0.20f;
+        wheel.radius = truck ? TRUCK_WHEEL_RADIUS : CAR_WHEEL_RADIUS;
+        wheel.halfWidth = truck ? TRUCK_WHEEL_HALF_WIDTH : CAR_WHEEL_HALF_WIDTH;
         wheel.x = body.x + rx;
         wheel.z = body.z + rz;
-        wheel.tilt = body.roll;
+        wheel.tilt = (float) Math.atan2(cos(body.pitch) * sin(body.roll), cos(body.roll));
         wheel.y = Math.max(body.y + cos(body.pitch) * rollY - sin(body.pitch) * mountZ,
                 rampHeight(wheel.x, wheel.z) + wheelClearance(wheel));
         wheel.yaw = wrap(body.yaw + side * (bend * 21f + endDent * 7f) * PI / 180f);
@@ -1015,6 +1250,7 @@ public final class World {
         wheel.tiltRate = -side * (2.2f + kick);
         wheel.spinRate = forwardSpeed(body) / wheel.radius + axle * kick * 3f;
         wheel.age = 0;
+        wheel.fromPlayer = truck;
         wheel.visible = true;
     }
 

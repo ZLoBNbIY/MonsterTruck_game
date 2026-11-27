@@ -27,7 +27,7 @@ final class Geometry {
     private static final int[] CAR_COLORS = {
         0x6cbcd9, 0xffcd68, 0xf89193, 0x66cdc3, 0xaf9cdd, 0xffae80
     };
-    private static final int GLASS = 0x569bbc;
+    private static final int GLASS_MATERIAL = -1;
     private static final int TRIM = 0x354659;
     private static final float WALK_Y = World.Tree.SIDEWALK_HEIGHT;
 
@@ -304,59 +304,91 @@ final class Geometry {
 
     static Mesh vehicle(boolean truck, int color, float front, float back, float left,
                         float right, float damage) {
+        return vehicle(truck, truck ? 0xef3521 : color, 0, front, back, left, right, damage);
+    }
+
+    static Mesh vehicle(boolean truck, int tint, int design, float front, float back, float left,
+                        float right, float damage) {
         Builder mesh = new Builder();
-        Deformation shape = new Deformation(truck, front, back, left, right, damage);
+        Deformation shape = new Deformation(truck, design, front, back, left, right, damage);
         if (truck) {
-            truck(mesh, shape);
+            truckChassis(mesh, shape);
+            if (shape.utility) utilityTruck(mesh, shape, tint);
+            else hotRod(mesh, shape, tint);
         } else {
-            car(mesh, shape, CAR_COLORS[Math.floorMod(color, CAR_COLORS.length)]);
+            car(mesh, shape, CAR_COLORS[Math.floorMod(tint, CAR_COLORS.length)]);
         }
         return mesh.finish();
     }
 
-    private static void truck(Builder mesh, Deformation shape) {
-        int paint = 0xef3521;
-        VehiclePanel body = panel(mesh, shape, Panel.BODY, paint, 0, 1.32f, -2.55f,
-                1.34f, 2.05f, 2.54f, .28f, .20f, .39f);
-        panel(mesh, shape, Panel.CABIN, 0xe82c22, 0, 1.94f, -1.33f, 1.11f, 2.89f, 1.17f,
-                .29f, .29f, .32f);
+    private static void hotRod(Builder mesh, Deformation shape, int paint) {
+        VehiclePanel body = panel(mesh, shape, Panel.BODY, paint, 0, 1.12f, -2.34f,
+                1.21f, 1.79f, 2.34f, .22f, .14f, .28f);
+        panel(mesh, shape, Panel.CABIN, shade(paint, .91f), 0, 1.70f, -1.15f, 1.00f, 2.46f, .76f,
+                .22f, .18f, .24f);
         truckPaint(mesh, body);
-        truckChassis(mesh, shape);
         for (int side = -1; side <= 1; side += 2) {
-            for (int axle = -1; axle <= 1; axle += 2) truckFender(mesh, shape, side, axle, paint);
+            for (int axle = -1; axle <= 1; axle += 2) wheelFlare(mesh, shape, side, axle, paint);
             truckPipes(mesh, shape, side);
-            detail(mesh, shape, 0xaa251c, side * 1.20f, 1.27f, -.65f, .16f, 1.51f, .66f, .094f);
-            detail(mesh, shape, 0x7d201b, side * 1.07f, 2.11f, -.57f, .068f, 2.19f, -.32f, .035f);
-            detail(mesh, shape, 0xffbf52, side * 1.10f, 2.145f, -.542f, .044f, 2.178f, -.363f, .014f);
-            detail(mesh, shape, 0x321f29, side * 1.06f, 2.19f, .48f, .17f, 2.35f, .73f, .072f);
-            detail(mesh, shape, 0xf84926, side * 1.13f, 2.235f, .51f, .12f, 2.372f, .70f, .061f);
-            detail(mesh, shape, 0x401c24, side * .83f, 1.66f, -2.57f, .25f, 1.91f, -2.39f, .090f);
-            detail(mesh, shape, 0xf76529, side * .85f, 1.742f, -2.585f, .184f, 1.87f, -2.50f, .044f);
-            detail(mesh, shape, 0xffaf49, side * .86f, 1.80f, -2.60f, .15f, 1.835f, -2.55f, .015f);
-            // Round inset lamps, with an amber bezel and a warm lens.
-            truckTube(mesh, shape, Builder.point(side * .88f, 1.83f, 2.35f),
-                    Builder.point(side * .88f, 1.88f, 2.55f),
-                    new float[][] {{0, .23f}, {.55f, .215f}, {.88f, .175f},
-                            {.95f, .133f}, {1, .102f}, {1.06f, 0}},
-                    new int[] {0x88231c, 0xe76c20, 0xffbf45, 0xffdf95, 0xfff3d4});
+            detail(mesh, shape, 0xf1bc64, side * .97f, 1.82f, -.70f, .042f, 1.87f, -.45f, .019f);
+            detail(mesh, shape, shade(paint, .69f), side * .97f, 1.94f, .27f, .13f, 2.05f, .45f, .051f);
+            detail(mesh, shape, 0x591e2b, side * .78f, 1.40f, -2.36f, .19f, 1.61f, -2.17f, .067f);
+            detail(mesh, shape, 0xff7154, side * .78f, 1.45f, -2.38f, .14f, 1.565f, -2.28f, .033f);
+            truckTube(mesh, shape, Builder.point(side * .83f, 1.61f, 2.09f),
+                    Builder.point(side * .83f, 1.65f, 2.32f),
+                    new float[][] {{0, .17f}, {.58f, .19f}, {.87f, .157f}, {1, .126f}, {1.08f, 0}},
+                    new int[] {shade(paint, .69f), 0xc4893e, 0xffca65, 0xffeecc});
         }
-        detail(mesh, shape, 0x93241b, 0, 1.57f, -2.584f, .69f, 1.94f, -2.41f, .096f);
-        detail(mesh, shape, 0xf2471d, 0, 1.62f, -2.603f, .62f, 1.898f, -2.48f, .074f);
-        detail(mesh, shape, 0x51252c, 0, 1.817f, -2.623f, .18f, 1.890f, -2.56f, .029f);
-        detail(mesh, shape, 0xffba45, 0, 1.684f, -2.627f, .43f, 1.731f, -2.55f, .021f);
-
-        detail(mesh, shape, 0xe78b23, 0, 1.54f, 2.37f, .65f, 1.98f, 2.594f, .125f);
-        detail(mesh, shape, 0x252732, 0, 1.60f, 2.50f, .54f, 1.927f, 2.615f, .090f);
+        detail(mesh, shape, 0xd29c57, 0, 1.24f, 2.21f, .51f, 1.85f, 2.40f, .105f);
+        detail(mesh, shape, 0x252732, 0, 1.28f, 2.34f, .435f, 1.80f, 2.414f, .061f);
         for (int bar = -3; bar <= 3; bar++) {
-            float top = 1.913f - .0045f * bar * bar;
-            detail(mesh, shape, bar == 0 ? 0xeca43f : 0x73818a, bar * .128f,
-                    1.649f, 2.606f, .023f, top, 2.634f, .012f);
+            detail(mesh, shape, bar == 0 ? 0xffbd59 : 0xaabcc3, bar * .105f,
+                    1.33f, 2.405f, .017f, 1.77f - .006f * bar * bar, 2.427f, .009f);
         }
-        detail(mesh, shape, 0x44222a, 0, 1.29f, 2.30f, 1.10f, 1.59f, 2.69f, .141f);
-        detail(mesh, shape, 0xf84724, 0, 1.44f, 2.43f, 1.08f, 1.61f, 2.705f, .079f);
-        detail(mesh, shape, 0x547784, 0, 1.23f, 2.44f, .56f, 1.40f, 2.708f, .072f);
-        detail(mesh, shape, 0x41232c, 0, 1.29f, -2.72f, 1.09f, 1.59f, -2.36f, .133f);
-        detail(mesh, shape, 0x62818d, 0, 1.325f, -2.757f, .70f, 1.48f, -2.60f, .060f);
+        detail(mesh, shape, 0x3c3340, 0, 1.00f, 2.13f, .95f, 1.25f, 2.43f, .103f);
+        detail(mesh, shape, 0x94a7ae, 0, 1.105f, 2.31f, .91f, 1.21f, 2.464f, .044f);
+        detail(mesh, shape, 0x3c3340, 0, 1.00f, -2.43f, 1.01f, 1.26f, -2.13f, .105f);
+        detail(mesh, shape, 0x94a7ae, 0, 1.10f, -2.466f, .89f, 1.21f, -2.31f, .043f);
+        detail(mesh, shape, 0xf1bc64, 0, 1.53f, -2.354f, .29f, 1.585f, -2.265f, .022f);
+    }
+
+    private static void utilityTruck(Builder mesh, Deformation shape, int paint) {
+        panel(mesh, shape, Panel.BODY, paint, 0, 1.08f, -2.31f, 1.28f, 1.76f, 2.28f,
+                .15f, .11f, .17f);
+        panel(mesh, shape, Panel.CABIN, paint, 0, 1.68f, -2.13f, 1.16f, 2.53f, .86f,
+                .13f, .105f, .14f);
+        detail(mesh, shape, 0x28303b, 0, 2.475f, -1.99f, .99f, 2.58f, .53f, .049f);
+        for (int side = -1; side <= 1; side += 2) {
+            for (int axle = -1; axle <= 1; axle += 2) wheelFlare(mesh, shape, side, axle, paint);
+            detail(mesh, shape, 0x343944, side * 1.18f, 1.065f, -.74f, .20f, 1.27f, .74f, .062f);
+            detail(mesh, shape, 0x829398, side * 1.35f, 1.205f, -.52f, .07f, 1.275f, .52f, .03f);
+            detail(mesh, shape, 0x313c49, side * .80f, 2.56f, -1.82f, .056f, 2.66f, .39f, .035f);
+            detail(mesh, shape, 0x313c49, side * 1.14f, 2.00f, .47f, .16f, 2.15f, .70f, .057f);
+            for (int door = 0; door < 2; door++) {
+                float z = -.22f - door * .88f;
+                detail(mesh, shape, 0x35404a, side * 1.14f, 1.77f, z, .055f, 1.835f, z + .23f, .023f);
+            }
+            detail(mesh, shape, 0x202731, side * .89f, 1.36f, 2.17f, .26f, 1.66f, 2.322f, .035f);
+            detail(mesh, shape, 0xdbedf0, side * .85f, 1.53f, 2.284f, .19f, 1.62f, 2.35f, .024f);
+            detail(mesh, shape, 0xffad54, side * .95f, 1.42f, 2.27f, .087f, 1.486f, 2.34f, .018f);
+            detail(mesh, shape, 0x29323e, side * .96f, 1.35f, -2.33f, .15f, 1.70f, -2.18f, .035f);
+            detail(mesh, shape, 0xf15b59, side * .96f, 1.49f, -2.356f, .10f, 1.66f, -2.27f, .025f);
+            detail(mesh, shape, 0xfbd49e, side * .96f, 1.39f, -2.354f, .10f, 1.447f, -2.27f, .019f);
+            detail(mesh, shape, 0xc1874b, side * .54f, .93f, 2.27f, .067f, 1.13f, 2.445f, .031f);
+        }
+        for (int bar = -1; bar <= 1; bar += 2) {
+            float z = -.69f + bar * .81f;
+            detail(mesh, shape, 0x61717c, 0, 2.605f, z - .048f, .845f, 2.65f, z + .048f, .02f);
+        }
+        detail(mesh, shape, 0x25303b, 0, 1.32f, 2.15f, .638f, 1.70f, 2.353f, .043f);
+        for (int bar = 0; bar < 3; bar++) {
+            float y = 1.39f + bar * .101f;
+            detail(mesh, shape, 0x8c9ba2, 0, y, 2.34f, .565f, y + .026f, 2.374f, .011f);
+        }
+        detail(mesh, shape, 0x343d46, 0, .98f, 2.13f, 1.13f, 1.30f, 2.428f, .07f);
+        detail(mesh, shape, 0x737f84, 0, .89f, 2.23f, .39f, 1.18f, 2.447f, .048f);
+        detail(mesh, shape, 0x343d46, 0, 1.02f, -2.428f, 1.14f, 1.29f, -2.15f, .067f);
+        detail(mesh, shape, 0x96a6a6, 0, 1.405f, -2.356f, .20f, 1.495f, -2.27f, .023f);
     }
 
     private static void truckPaint(Builder mesh, VehiclePanel body) {
@@ -438,30 +470,30 @@ final class Geometry {
     }
 
     private static void truckChassis(Builder mesh, Deformation shape) {
-        detail(mesh, shape, 0x28303e, 0, .91f, -.87f, .53f, 1.35f, .96f, .12f);
-        detail(mesh, shape, 0x536675, 0, .88f, -.51f, .34f, .99f, .57f, .053f);
+        detail(mesh, shape, 0x28303e, 0, .79f, -.87f, .53f, 1.18f, .96f, .12f);
+        detail(mesh, shape, 0x536675, 0, .76f, -.51f, .34f, .86f, .57f, .047f);
         for (int axle = -1; axle <= 1; axle += 2) {
             float z = axle * shape.axle;
-            detail(mesh, shape, 0x4a6473, 0, .735f, z - .185f, .235f, 1.08f, z + .185f, .12f);
+            detail(mesh, shape, 0x4a6473, 0, .625f, z - .17f, .21f, .94f, z + .17f, .10f);
         }
         for (int side = -1; side <= 1; side += 2) {
-            detail(mesh, shape, 0x323239, side * .57f, 1.01f, -2.20f, .14f, 1.40f, 2.22f, .095f);
+            detail(mesh, shape, 0x323239, side * .57f, .91f, -2.13f, .14f, 1.21f, 2.14f, .083f);
             for (int axle = -1; axle <= 1; axle += 2) {
                 float z = axle * shape.axle;
                 truckRod(mesh, shape, Builder.point(0, shape.wheelY, z),
-                        Builder.point(side * 1.38f, shape.wheelY, z), .091f, 0x455665);
-                truckRod(mesh, shape, Builder.point(side * .54f, .98f, axle * .31f),
-                        Builder.point(side * 1.25f, .79f, z), .048f, 0x748d97);
-                truckRod(mesh, shape, Builder.point(side * 1.28f, .66f, axle * .69f),
-                        Builder.point(side * 1.22f, .71f, z), .051f, 0x435a69);
+                        Builder.point(side * World.TRUCK_WHEEL_X, shape.wheelY, z), .082f, 0x455665);
+                truckRod(mesh, shape, Builder.point(side * .54f, .89f, axle * .31f),
+                        Builder.point(side * 1.25f, .70f, z), .048f, 0x748d97);
+                truckRod(mesh, shape, Builder.point(side * 1.19f, .63f, axle * .71f),
+                        Builder.point(side * 1.20f, .68f, z), .051f, 0x435a69);
                 truckShock(mesh, shape, side, axle);
             }
         }
     }
 
     private static void truckShock(Builder mesh, Deformation shape, int side, int axle) {
-        float x = side * 1.28f, y = .66f, z = axle * .69f;
-        float height = .83f, lean = axle * -.15f, inward = side * -.15f;
+        float x = side * 1.19f, y = .63f, z = axle * .71f;
+        float height = .65f, lean = axle * -.11f, inward = side * -.14f;
         float[] lower = Builder.point(x, y, z), upper = Builder.point(x + inward, y + height, z + lean);
         truckTube(mesh, shape, lower, upper,
                 new float[][] {{0, .11f}, {.12f, .11f}, {.15f, .066f}, {.44f, .066f},
@@ -499,13 +531,13 @@ final class Geometry {
     }
 
     private static void truckPipes(Builder mesh, Deformation shape, int side) {
-        truckRod(mesh, shape, Builder.point(side * .97f, 1.32f, .38f),
-                Builder.point(side * 1.37f, 1.16f, .20f), .081f, 0x237ba6);
-        truckRod(mesh, shape, Builder.point(side * 1.07f, 1.35f, -.53f),
-                Builder.point(side * 1.36f, 1.18f, -.53f), .051f, 0x506773);
+        truckRod(mesh, shape, Builder.point(side * .97f, 1.19f, .38f),
+                Builder.point(side * 1.29f, 1.02f, .20f), .081f, 0x237ba6);
+        truckRod(mesh, shape, Builder.point(side * 1.07f, 1.21f, -.53f),
+                Builder.point(side * 1.28f, 1.04f, -.53f), .051f, 0x506773);
         // A rolled lip and recessed end make the blue exhaust read as a hollow pipe.
-        truckTube(mesh, shape, Builder.point(side * 1.36f, 1.16f, .26f),
-                Builder.point(side * 1.40f, 1.24f, -.86f),
+        truckTube(mesh, shape, Builder.point(side * 1.28f, 1.02f, .28f),
+                Builder.point(side * 1.34f, 1.11f, -.76f),
                 new float[][] {{0, .070f}, {.10f, .078f}, {.13f, .130f}, {.19f, .141f},
                         {.27f, .141f}, {.29f, .127f}, {.67f, .127f}, {.70f, .146f},
                         {.80f, .146f}, {.83f, .113f}, {.95f, .113f}, {.98f, .143f},
@@ -565,28 +597,34 @@ final class Geometry {
         }
     }
 
-    private static void truckFender(Builder mesh, Deformation shape, int side, int axle, int paint) {
+    private static void wheelFlare(Builder mesh, Deformation shape, int side, int axle, int paint) {
         // Cross-section runs from the painted shoulder across the lip to the wheel-well liner.
-        float[] widths = {1.14f, 1.30f, 1.48f, 1.625f, 1.676f, 1.687f, 1.65f, 1.54f, 1.28f};
-        float[] radii = {1.04f, 1.186f, 1.215f, 1.171f, 1.128f, 1.055f, 1.01f, .978f, .974f};
-        int[] colors = {paint, paint, 0xff5730, 0xed8622, 0xffdf62, 0xffaf2d, 0x9e461c, 0x3c2b31, 0x28262a};
+        float[] widths = shape.truck ? new float[] {1.05f, 1.31f, 1.61f, 1.78f, 1.80f, 1.75f, 1.28f}
+                : new float[] {.86f, .912f, .942f, .976f, .982f, .965f, .88f};
+        float[] radii = shape.truck ? new float[] {.91f, .99f, .99f, .951f, .875f, .849f, .833f}
+                : new float[] {.413f, .424f, .416f, .399f, .379f, .367f, .362f};
+        int lip = shape.utility ? 0x46515a : shape.truck ? 0xe7ad53 : shade(paint, .84f);
+        int arch = shape.utility ? 0x323942 : paint;
+        int[] colors = {paint, arch, shade(arch, 1.14f), lip, shade(lip, .70f), 0x3f444e, 0x2b303b};
         float[][] previous = new float[widths.length][3];
         float[][] current = new float[widths.length][3];
-        int segments = 22;
+        float start = shape.truck ? .21f : .04f;
+        float sweep = (float) Math.PI - 2 * start;
+        int segments = 24;
         for (int step = 0; step <= segments; step++) {
             float fraction = step / (float) segments;
-            float angle = .36f + 2.42f * fraction;
+            float angle = start + sweep * fraction;
             float sin = (float) Math.sin(angle), cos = (float) Math.cos(angle);
-            float fade = smooth(Math.min(fraction, 1 - fraction) * 7f);
+            float fade = smooth(Math.min(fraction, 1 - fraction) * (shape.truck ? 4.5f : 9f));
             for (int ring = 0; ring < widths.length; ring++) {
-                float radius = .982f + (radii[ring] - .982f) * fade;
-                float x = 1.15f + (widths[ring] - 1.15f) * fade;
-                shape.apply(side * x, shape.wheelY + radius * sin, axle * shape.axle + radius * cos,
-                        current[ring]);
+                float radius = shape.archRadius + (radii[ring] - shape.archRadius) * fade;
+                float x = widths[0] + (widths[ring] - widths[0]) * fade;
+                float y = shape.wheelY + radius * sin;
+                shape.apply(side * x, y, axle * shape.axle + radius * cos, current[ring]);
             }
             if (step > 0) {
                 float now = .66f + .37f * sin + .08f * cos;
-                float a = angle - 2.42f / segments;
+                float a = angle - sweep / segments;
                 float before = .66f + .37f * (float) Math.sin(a) + .08f * (float) Math.cos(a);
                 for (int ring = 0; ring + 1 < widths.length; ring++) {
                     int outerBefore = shade(colors[ring], before);
@@ -617,6 +655,7 @@ final class Geometry {
         detail(mesh, shape, 0x3f4b53, 0, .49f, -2.02f, .19f, .59f, -1.94f, .026f);
         detail(mesh, shape, 0xcad2d2, 0, .51f, -2.027f, .143f, .568f, -1.997f, .014f);
         for (int side = -1; side <= 1; side += 2) {
+            for (int axle = -1; axle <= 1; axle += 2) wheelFlare(mesh, shape, side, axle, paint);
             detail(mesh, shape, 0xfff0ce, side * .64f, .602f, 1.82f, .207f, .727f, 1.98f, .048f);
             detail(mesh, shape, 0xd94252, side * .64f, .59f, -1.99f, .20f, .727f, -1.885f, .04f);
             detail(mesh, shape, shade(paint, .59f), side * .922f, .755f, -.26f, .018f, .793f, -.09f, .014f);
@@ -658,7 +697,7 @@ final class Geometry {
             this.origin = origin;
             this.span = span;
             this.bevel = bevel;
-            paintFaces = kind == Panel.BODY && shape.truck ? new float[4][][] : null;
+            paintFaces = kind == Panel.BODY && shape.truck && !shape.utility ? new float[4][][] : null;
             border = new float[3];
             for (int axis = 0; axis < 3; axis++) {
                 bevel[axis] = Math.min(bevel[axis], span[axis] * .47f);
@@ -693,14 +732,14 @@ final class Geometry {
                         samples[count++] = unit((z - origin[2]) / span[2]);
                     }
                 }
-                if (shape.truck) {
-                    for (float z : new float[] {-2.43f, -2.34f, -2.25f, -1.57f, -1.48f, -1.32f}) {
+                if (paintFaces != null) {
+                    for (float z : new float[] {-2.22f, -2.13f, -2.05f, -1.36f, -1.27f, -1.12f}) {
                         samples[count++] = (z - origin[2]) / span[2];
                     }
                 }
-            } else if (kind == Panel.BODY && shape.truck && axis == 0) {
-                for (float x : new float[] {-1.24f, -1.10f, -.87f, -.63f, -.39f, -.15f,
-                        .15f, .39f, .63f, .87f, 1.10f, 1.24f}) {
+            } else if (paintFaces != null && axis == 0) {
+                for (float x : new float[] {-1.13f, -.99f, -.87f, -.63f, -.39f, -.15f,
+                        .15f, .39f, .63f, .87f, .99f, 1.13f}) {
                     samples[count++] = (x - origin[0]) / span[0];
                 }
             }
@@ -760,7 +799,7 @@ final class Geometry {
                     param[uAxis] = (u[i] + u[i + 1]) * .5f;
                     param[vAxis] = (v[j] + v[j + 1]) * .5f;
                     int color = material(axis, param);
-                    boolean glass = reflection != null && color == GLASS;
+                    boolean glass = reflection != null && color == GLASS_MATERIAL;
                     int ca = glass ? glassColor(reflection[a]) : shade(color, light[a]);
                     int cb = glass ? glassColor(reflection[b]) : shade(color, light[b]);
                     int cc = glass ? glassColor(reflection[c]) : shade(color, light[c]);
@@ -797,10 +836,10 @@ final class Geometry {
         }
 
         private int material(int axis, float[] param) {
-            if (kind == Panel.BODY && shape.truck && axis == 1 && param[1] == 1) {
+            if (paintFaces != null && axis == 1 && param[1] == 1) {
                 float z = origin[2] + span[2] * param[2];
                 float x = origin[0] + span[0] * param[0];
-                if (z > -2.34f && z < -1.48f && Math.abs(x) < 1.10f) return 0x403b3e;
+                if (z > -2.13f && z < -1.27f && Math.abs(x) < .99f) return 0x403b3e;
             }
             if (kind != Panel.CABIN || axis == 1) return paint;
             float height = param[1];
@@ -814,7 +853,7 @@ final class Geometry {
                 if (across < .11f || across > .89f) return TRIM;
             }
             if (height < .20f || height > .79f) return TRIM;
-            return GLASS;
+            return GLASS_MATERIAL;
         }
 
         private int glassColor(float reflection) {
@@ -862,35 +901,37 @@ final class Geometry {
                 float opening = Math.max(0, shape.wheelY + wheelProfile - origin[1]);
                 float shoulder = unit((across - (shape.truck ? .64f : .61f)) * 6);
                 y += opening * shoulder * (1 - height);
-                float taper = shape.truck ? .135f : z > 0 ? .185f : .125f;
+                float taper = shape.utility ? .063f : shape.truck ? .105f : z > 0 ? .185f : .125f;
                 y -= taper * height * end * end * end;
-                y -= (shape.truck ? .065f : .083f) * height * across * across;
-                x *= 1 - .10f * end * end * end - .09f * (1 - height)
-                        + (shape.truck ? .12f : .057f) * ridge(wheelDistance, shape.archRadius * 1.15f);
-                if (shape.truck) {
-                    float bed = smooth((-z - 1.32f) / .24f) * smooth((z + 2.43f) / .18f)
-                            * smooth((1.16f - Math.abs(x)) / .25f);
+                y -= (shape.utility ? .039f : shape.truck ? .058f : .083f) * height * across * across;
+                float axleShoulder = ridge(wheelDistance, shape.archRadius * 1.35f);
+                x *= 1 - (shape.utility ? .043f : .10f) * end * end * end - .09f * (1 - height)
+                        + (shape.truck ? .088f : .096f) * axleShoulder;
+                if (shape.truck && !shape.utility) {
+                    float bed = smooth((-z - 1.12f) / .22f) * smooth((z + 2.22f) / .19f)
+                            * smooth((1.06f - Math.abs(x)) / .25f);
                     float rib = ridge(Math.abs(x) % .24f - .15f, .065f);
-                    y -= (.32f - .036f * rib) * bed * height * height;
-                    float hood = smooth((z - .12f) / 1.02f) * smooth((2.63f - z) / .75f);
-                    y += height * (hood * (.27f + .048f * ridge(x, .53f))
-                            * (1 - across * across) + .075f * shoulder * ridge(wheelDistance, 1.06f));
-                    x += Math.copySign(.044f * ridge(z + .22f, 1.13f) * shoulder
+                    y -= (.25f - .028f * rib) * bed * height * height;
+                    float hood = smooth((z - .12f) / .91f) * smooth((2.40f - z) / .71f);
+                    y += height * (hood * (.24f + .042f * ridge(x, .53f))
+                            * (1 - across * across) + .046f * shoulder * axleShoulder);
+                    x += Math.copySign(.034f * ridge(z + .22f, 1.13f) * shoulder
                             * ridge(height - .65f, .57f), x);
-                    z -= Math.copySign(.17f * unit(end * end * end) * across * across, z);
-                } else {
+                    z -= Math.copySign(.12f * unit(end * end * end) * across * across, z);
+                } else if (!shape.truck) {
                     y += .054f * height * ridge(z - 1.23f, .71f) * (1 - across * across);
                 }
             } else if (kind == Panel.CABIN) {
-                x *= 1 - (shape.truck ? .31f : .29f) * height * height;
+                x *= 1 - (shape.utility ? .085f : shape.truck ? .30f : .29f) * height * height;
                 float along = (z - origin[2]) / span[2];
                 float rake = height * (.83f + .17f * height);
-                z += rake * ((shape.truck ? .42f : .83f) * (1 - along)
-                        - (shape.truck ? .78f : .86f) * along);
+                z += rake * ((shape.utility ? .15f : shape.truck ? .32f : .83f) * (1 - along)
+                        - (shape.utility ? .35f : shape.truck ? .55f : .86f) * along);
                 float across = x / shape.halfWidth;
-                y += height * (.045f - .13f * across * across
-                        - (shape.truck ? .15f : .19f) * (2 * along - 1) * (2 * along - 1));
-                z += (shape.truck ? .14f : .105f) * (2 * along - 1)
+                y += height * ((shape.utility ? .024f : .045f)
+                        - (shape.utility ? .055f : .13f) * across * across
+                        - (shape.utility ? .036f : shape.truck ? .12f : .19f) * (2 * along - 1) * (2 * along - 1));
+                z += (shape.utility ? .055f : shape.truck ? .115f : .105f) * (2 * along - 1)
                         * (1 - across * across) * ridge(height - .47f, .53f);
             }
             shape.apply(x, y, z, out);
@@ -899,6 +940,7 @@ final class Geometry {
 
     private static final class Deformation {
         private final boolean truck;
+        private final boolean utility;
         private final float halfWidth;
         private final float halfLength;
         private final float baseY;
@@ -913,16 +955,17 @@ final class Geometry {
         private final float right;
         private final float damage;
 
-        Deformation(boolean truck, float front, float back, float left, float right, float damage) {
+        Deformation(boolean truck, int design, float front, float back, float left, float right, float damage) {
             this.truck = truck;
-            halfWidth = truck ? 1.43f : .94f;
-            halfLength = truck ? 2.55f : 1.97f;
-            baseY = truck ? 1.25f : .33f;
-            beltY = truck ? 2.02f : .88f;
-            roofHeight = truck ? .99f : .61f;
-            axle = truck ? 1.69f : 1.29f;
-            wheelY = truck ? .92f : .35f;
-            archRadius = truck ? .975f : .388f;
+            utility = truck && design == 1;
+            halfWidth = truck ? 1.33f : .94f;
+            halfLength = truck ? 2.34f : 1.97f;
+            baseY = truck ? 1.10f : .33f;
+            beltY = truck ? 1.76f : .88f;
+            roofHeight = utility ? .90f : truck ? .76f : .61f;
+            axle = truck ? World.TRUCK_WHEEL_Z : World.CAR_WHEEL_Z;
+            wheelY = truck ? World.TRUCK_WHEEL_Y : World.CAR_WHEEL_Y;
+            archRadius = truck ? World.TRUCK_WHEEL_RADIUS + .067f : World.CAR_WHEEL_RADIUS + .026f;
             this.front = unit(front);
             this.back = unit(back);
             this.left = unit(left);
