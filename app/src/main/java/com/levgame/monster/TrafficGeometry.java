@@ -14,6 +14,11 @@ final class TrafficGeometry {
     private static final int HEADLIGHT = 0xe7e7d8;
     private static final int TAILLIGHT = 0xc9383a;
     private static final int MARKER = 0xeaa749;
+    private static final int WHOLE = 0, TRACTOR = 1, TRAILER = 2;
+    private static final float HITCH_Z = .42f; // In units of the original half-length.
+    private static final float TRACTOR_RAIL_REAR = .23f;
+    private static final float TRACTOR_BODY_REAR = .44f;
+    private static final float TRAILER_NOSE = .35f;
     private static final int[] PAINT = {
         0x698ea8, 0xd7b164, 0xa4554c, 0x5c8c80, 0x77798e, 0xc9c8ba
     };
@@ -22,8 +27,16 @@ final class TrafficGeometry {
 
     static Geometry.Mesh mesh(TrafficModel type, int color, float front, float back,
                               float left, float right, float roof, boolean flattened) {
+        return mesh(type, color, front, back, left, right, roof, flattened, WHOLE, 0f);
+    }
+
+    static Geometry.Mesh mesh(TrafficModel type, int color, float front, float back,
+                              float left, float right, float roof, boolean flattened,
+                              int part, float centerZ) {
+        int component = type.hasTrailer() ? part : WHOLE;
         int paint = PAINT[Math.floorMod(color, PAINT.length)];
-        Body body = new Body(type, paint, front, back, left, right, roof, flattened);
+        Body body = new Body(type, paint, front, back, left, right, roof, flattened,
+                component, centerZ);
         body.chassis();
         if (flattened) {
             body.crushed();
@@ -36,25 +49,37 @@ final class TrafficGeometry {
                 case COACH: body.bus(true); break;
                 case BOX_TRUCK: body.truckCab(.42f, false, .79f); body.cargoBox(.31f, false); break;
                 case DUMP_TRUCK: body.truckCab(.43f, false, .95f); body.dumpBed(); break;
-                case SEMI_BOX: body.truckCab(.53f, true, .85f); body.cargoBox(.34f, true); break;
-                case SEMI_FLATBED: body.truckCab(.53f, true, 1f); body.flatbed(); break;
-                case SEMI_TANKER: body.truckCab(.53f, true, .90f); body.tanker(); break;
+                case SEMI_BOX:
+                    if (component != TRAILER) body.truckCab(.53f, true, .85f);
+                    if (component != TRACTOR) body.cargoBox(.34f, true);
+                    break;
+                case SEMI_FLATBED:
+                    if (component != TRAILER) body.truckCab(.53f, true, 1f);
+                    if (component != TRACTOR) body.flatbed();
+                    break;
+                case SEMI_TANKER:
+                    if (component != TRAILER) body.truckCab(.53f, true, .90f);
+                    if (component != TRACTOR) body.tanker();
+                    break;
             }
         }
+        if (component != WHOLE) body.hitch();
         return body.mesh.finish();
     }
 
     private static final class Body {
-        final MeshBuilder mesh = new MeshBuilder();
+        final MeshBuilder mesh;
         final TrafficModel type;
         final int paint;
         final float width, length, height;
         final float front, back, left, right, roof;
         final float radius;
         final boolean flattened;
+        final int part;
+        final float centerZ, dentCenter, dentHalfLength;
 
         Body(TrafficModel type, int paint, float front, float back, float left, float right,
-             float roof, boolean flattened) {
+             float roof, boolean flattened, int part, float centerZ) {
             this.type = type;
             this.paint = paint;
             width = type.halfWidth;
@@ -67,6 +92,14 @@ final class TrafficGeometry {
             this.right = clamp(right);
             this.roof = clamp(roof);
             this.flattened = flattened;
+            this.part = part;
+            this.centerZ = centerZ;
+            mesh = new MeshBuilder(centerZ);
+            // Dent coordinates describe the body shell; the caller can place the mesh origin anywhere.
+            float rear = part == TRACTOR ? TRACTOR_BODY_REAR : -1f;
+            float nose = part == TRAILER ? TRAILER_NOSE : 1f;
+            dentCenter = (rear + nose) * .5f;
+            dentHalfLength = (nose - rear) * .5f;
         }
 
         void passenger(float rearBase, float rearRoof, float frontRoof, float frontBase) {
@@ -356,17 +389,46 @@ final class TrafficGeometry {
             float rail = Math.min(.64f, (type.wheelX - type.halfTireWidth) / width * .86f);
             float y = radius / height;
             for (int side = -1; side <= 1; side += 2) {
-                if (!flattened && type.axles.length == 5) {
-                    box(side * rail * .68f, y * .72f, -.92f, side * rail, y * 1.25f, -.42f, FRAME);
-                    box(side * rail * .68f, y * .72f, .23f, side * rail, y * 1.25f, .92f, FRAME);
+                if (type.hasTrailer() && (!flattened || part != WHOLE)) {
+                    if (part != TRACTOR) {
+                        box(side * rail * .68f, y * .72f, -.92f, side * rail, y * 1.25f, -.42f, FRAME);
+                    }
+                    if (part != TRAILER) {
+                        box(side * rail * .68f, y * .72f, TRACTOR_RAIL_REAR,
+                                side * rail, y * 1.25f, .92f, FRAME);
+                    }
                 } else {
                     box(side * rail * .68f, y * .72f, -.92f, side * rail, y * 1.25f, .92f, FRAME);
                 }
             }
             for (float axle : type.axles) {
-                float z = axle / length;
+                if (!ownsAxle(axle)) continue;
+                boolean whole = part == WHOLE;
+                float z = (axle + (whole ? 0f : wheelShift(axle))) / length;
                 box(-rail * 1.07f, y * .88f, z - .06f / length, rail * 1.07f,
-                        y * 1.11f, z + .06f / length, FRAME);
+                        y * 1.11f, z + .06f / length, FRAME, whole);
+            }
+        }
+
+        boolean ownsAxle(float axle) {
+            return part == WHOLE || (part == TRACTOR ? axle >= 0f : axle < 0f);
+        }
+
+        void hitch() {
+            // Center the plate and kingpin on the shared yaw pivot. Keep both rigid under dents.
+            float plate = (flattened ? .46f : .78f) / height;
+            float plateBottom = plate - .055f / height;
+            float support = (flattened ? radius * .72f : radius * 1.25f) / height;
+            if (part == TRACTOR) {
+                rigidBox(-.58f, support, HITCH_Z - .032f, .58f, plateBottom, HITCH_Z + .032f, FRAME);
+                rigidBox(-.42f, plateBottom, HITCH_Z - .053f,
+                        .42f, plate, HITCH_Z + .053f, STEEL);
+            } else {
+                float tongue = plate + .055f / height;
+                rigidBox(-.10f, plate, HITCH_Z - .019f, .10f, tongue, HITCH_Z + .019f, STEEL);
+                rigidBox(-.24f, flattened ? .30f / height : tongue, .26f,
+                        .24f, tongue + .095f / height,
+                        HITCH_Z + .03f, FRAME);
             }
         }
 
@@ -375,15 +437,18 @@ final class TrafficGeometry {
             float inner = (type.wheelX - type.halfTireWidth - .17f) / width;
             float[] stations = new float[5 + type.axles.length * 4];
             int count = 0;
-            stations[count++] = -1f;
-            stations[count++] = -.25f;
-            stations[count++] = .03f;
-            stations[count++] = .28f;
-            stations[count++] = 1f;
+            float rear = part == TRACTOR ? .48f : -1f;
+            float nose = part == TRAILER ? TRAILER_NOSE : 1f;
+            float deckCenter = (rear + nose) * .5f;
+            float deckHalfLength = (nose - rear) * .5f;
+            for (float z : new float[] {-1f, -.25f, .03f, .28f, 1f}) {
+                stations[count++] = deckCenter + z * deckHalfLength;
+            }
             for (float axle : type.axles) {
+                if (!ownsAxle(axle)) continue;
                 for (float delta : new float[] {-radius - .2f, -radius, radius, radius + .2f}) {
                     float z = (archCenter(axle) + delta) / length;
-                    if (z > -1f && z < 1f) stations[count++] = z;
+                    if (z > rear && z < nose) stations[count++] = z;
                 }
             }
             Arrays.sort(stations, 0, count);
@@ -392,18 +457,23 @@ final class TrafficGeometry {
                 float z = stations[i];
                 float tire = 0f;
                 for (float axle : type.axles) {
+                    if (!ownsAxle(axle)) continue;
                     tire = Math.max(tire, 1f - ramp(Math.abs(z * length - archCenter(axle)),
                             radius, radius + .2f));
                 }
+                float profile = (z - deckCenter) / deckHalfLength;
                 deck[i][0] = z;
-                deck[i][1] = mix(.86f + .095f * ridge(z, .09f, .73f), inner, tire);
-                deck[i][2] = .58f + .34f * ridge(z, -.14f, 1.15f);
+                deck[i][1] = mix(.86f + .095f * ridge(profile, .09f, .73f), inner, tire);
+                deck[i][2] = .58f + .34f * ridge(profile, -.14f, 1.15f);
             }
             shell(deck, .14f, shade(paint, .92f), false);
-            cabin(inner * .98f, inner * .87f, inner * .92f, .712f, 1f,
-                    -.59f, .54f, -.41f, .26f, 2);
-            fascia(1, .79f, .16f, .53f, false);
-            fascia(-1, .82f, .18f, .56f, false);
+            if (part != TRAILER) {
+                cabin(inner * .98f, inner * .87f, inner * .92f, .712f, 1f,
+                        deckCenter - .59f * deckHalfLength, deckCenter + .54f * deckHalfLength,
+                        deckCenter - .41f * deckHalfLength, deckCenter + .26f * deckHalfLength, 2);
+                fascia(1, .79f, .16f, .53f, false);
+            }
+            if (part != TRACTOR) fascia(-1, .82f, .18f, .56f, false);
         }
 
         void shell(float[][] deck, float bottom, int color) {
@@ -434,6 +504,7 @@ final class TrafficGeometry {
             cuts[count++] = b[0];
             if (wheelWells) {
                 for (float axle : type.axles) {
+                    if (!ownsAxle(axle)) continue;
                     for (int step = -3; step <= 3; step++) {
                         float z = (archCenter(axle) + step * (radius + .075f) / 3) / length;
                         if (z > a[0] && z < b[0]) cuts[count++] = z;
@@ -464,6 +535,7 @@ final class TrafficGeometry {
             float clearance = radius + .075f;
             float low = sill;
             for (float axle : type.axles) {
+                if (!ownsAxle(axle)) continue;
                 float fraction = Math.abs(z * length - archCenter(axle)) / clearance;
                 if (fraction < 1f) {
                     float shoulder = Math.min(1f, (1f - fraction) * 3f);
@@ -475,9 +547,22 @@ final class TrafficGeometry {
         }
 
         float archCenter(float axle) {
-            float end = axle < 0f ? back : front;
-            float shellShift = ramp(Math.abs(axle) / length, .57f, 1f) * (.15f + .106f * length) * .77f;
-            return axle - Math.copySign(1f, axle) * end * (.20f - shellShift);
+            if (part == WHOLE) {
+                float end = axle < 0f ? back : front;
+                float shellShift = ramp(Math.abs(axle) / length, .57f, 1f)
+                        * (.15f + .106f * length) * .77f;
+                return axle - Math.copySign(1f, axle) * end * (.20f - shellShift);
+            }
+            float z = axle / length;
+            float local = dentZ(z);
+            float shellShift = endDent(local) * (.15f + .106f * length * dentHalfLength) * .77f;
+            return axle + wheelShift(axle) + Math.signum(local) * shellShift;
+        }
+
+        float wheelShift(float axle) {
+            // Match the suspension's inward movement relative to the component origin.
+            float local = axle - centerZ;
+            return -Math.copySign(.20f, local) * (local < 0f ? back : front);
         }
 
         void cabin(float lowerWidth, float rearWidth, float frontWidth, float base, float top,
@@ -539,34 +624,60 @@ final class TrafficGeometry {
 
         float[] p(float x, float y, float z) {
             // Localized, piecewise-linear folds preserve the undamaged panels and axle clearance.
-            float end = ramp(Math.abs(z), .57f, 1f);
-            float cap = (z < 0f ? back : front) * end;
+            float local = dentZ(z);
+            float cap = endDent(local);
             float side = (x < 0f ? left : right) * ramp(Math.abs(x), .47f, 1f);
-            float dent = side * ridge(z + .14f * x, .03f, .66f) * ridge(y, .45f, .59f);
-            float across = .77f - .17f * x * Math.signum(z);
-            float fold = ridge(Math.abs(z) - .10f * x, .82f, .19f);
+            float dent = side * ridge(local + .14f * x, .03f, .66f) * ridge(y, .45f, .59f);
+            float across = .77f - .17f * x * Math.signum(local);
+            float fold = ridge(Math.abs(local) - .10f * x, .82f, .19f);
             float roofWeight = ramp(y, .54f, 1f);
             float buckle = roof * roofWeight * (.22f + .13f * ridge(x, -.18f, 1.1f)
-                    * ridge(z, .06f, .82f));
+                    * ridge(local, .06f, .82f));
             if (flattened) buckle *= .3f;
             float xOut = x * (1f - .22f * dent) + .047f * cap * x * fold;
-            float zOut = z - Math.signum(z) * cap * across * (.15f / length + .106f)
-                    + .035f * dent * Math.signum(x);
+            float zOut = z - Math.signum(local) * cap * across * (.15f / length + .106f * dentHalfLength)
+                    + .035f * dent * Math.signum(x) * dentHalfLength;
             float yOut = y + cap * (.11f * fold - .12f * across) * ramp(y, .05f, .55f)
                     - .064f * dent - buckle;
-            return new float[] {xOut * width, Math.max(.025f, Math.min(1f, yOut) * height), zOut * length};
+            return point(xOut, yOut, zOut);
+        }
+
+        float dentZ(float z) {
+            return (z - dentCenter) / dentHalfLength;
+        }
+
+        float endDent(float z) {
+            return (z < 0f ? back : front) * ramp(Math.abs(z), .57f, 1f);
+        }
+
+        float[] point(float x, float y, float z) {
+            return new float[] {x * width, Math.max(.025f, Math.min(1f, y) * height), z * length};
         }
 
         void box(float x0, float y0, float z0, float x1, float y1, float z1, int color) {
+            box(x0, y0, z0, x1, y1, z1, color, true);
+        }
+
+        void rigidBox(float x0, float y0, float z0, float x1, float y1, float z1, int color) {
+            box(x0, y0, z0, x1, y1, z1, color, false);
+        }
+
+        void box(float x0, float y0, float z0, float x1, float y1, float z1, int color, boolean dented) {
             float minX = Math.min(x0, x1), maxX = Math.max(x0, x1);
-            float[] a = p(minX, y0, z0), b = p(maxX, y0, z0), c = p(maxX, y0, z1), d = p(minX, y0, z1);
-            float[] e = p(minX, y1, z0), f = p(maxX, y1, z0), g = p(maxX, y1, z1), h = p(minX, y1, z1);
+            float[] a = boxPoint(minX, y0, z0, dented), b = boxPoint(maxX, y0, z0, dented);
+            float[] c = boxPoint(maxX, y0, z1, dented), d = boxPoint(minX, y0, z1, dented);
+            float[] e = boxPoint(minX, y1, z0, dented), f = boxPoint(maxX, y1, z0, dented);
+            float[] g = boxPoint(maxX, y1, z1, dented), h = boxPoint(minX, y1, z1, dented);
             quad(a, b, c, d, color);
             quad(e, h, g, f, color);
             quad(b, a, e, f, color);
             quad(d, c, g, h, color);
             quad(a, d, h, e, color);
             quad(c, b, f, g, color);
+        }
+
+        float[] boxPoint(float x, float y, float z, boolean dented) {
+            return dented ? p(x, y, z) : point(x, y, z);
         }
 
         void endPanel(int end, float z, float x0, float x1, float bottom, float top, int color) {
@@ -625,8 +736,13 @@ final class TrafficGeometry {
 
     private static final class MeshBuilder {
         private static final int STRIDE = 6;
+        private final float centerZ;
         private float[] vertices = new float[STRIDE * 512];
         private int size;
+
+        MeshBuilder(float centerZ) {
+            this.centerZ = centerZ;
+        }
 
         void quad(float[] a, float[] b, float[] c, float[] d, int color) {
             triangle(a, b, c, color);
@@ -650,7 +766,7 @@ final class TrafficGeometry {
         private void vertex(float[] point, int color) {
             vertices[size++] = point[0];
             vertices[size++] = point[1];
-            vertices[size++] = point[2];
+            vertices[size++] = point[2] - centerZ;
             vertices[size++] = ((color >> 16) & 255) / 255f;
             vertices[size++] = ((color >> 8) & 255) / 255f;
             vertices[size++] = (color & 255) / 255f;

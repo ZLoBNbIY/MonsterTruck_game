@@ -30,4 +30,8 @@ enum TrafficModel {
     boolean isPassengerCar() {
         return height < 2f;
     }
+
+    boolean hasTrailer() {
+        return this == SEMI_BOX || this == SEMI_FLATBED || this == SEMI_TANKER;
+    }
 }

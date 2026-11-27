@@ -33,6 +33,26 @@ final class Geometry {
 
     private Geometry() {}
 
+    static int impactShardColor(int colorIndex) {
+        return colorIndex < 0 ? 0xb6bccb : CAR_COLORS[Math.floorMod(colorIndex, CAR_COLORS.length)];
+    }
+
+    // Triangle fans for the camera-facing crash effects; each pair is an X/Y coordinate.
+    static final float[] IMPACT_FLASH = effectOutline(new float[] {1f, .26f, .78f, .25f,
+            .88f, .23f, .68f, .25f, .95f, .22f, .73f, .27f}, .16f);
+    static final float[] IMPACT_CLOUD = effectOutline(new float[] {.86f, 1f, .95f, .84f,
+            .97f, .91f, 1f, .94f, .87f, .98f}, 0f);
+
+    private static float[] effectOutline(float[] radii, float angleOffset) {
+        float[] outline = new float[radii.length * 2];
+        for (int i = 0; i < radii.length; i++) {
+            double angle = i * 2 * Math.PI / radii.length + angleOffset;
+            outline[2 * i] = radii[i] * (float) Math.cos(angle);
+            outline[2 * i + 1] = radii[i] * (float) Math.sin(angle);
+        }
+        return outline;
+    }
+
     static boolean onDirt(float x, float z) {
         return x > World.YARD_MIN_X && z > World.YARD_MIN_Z
                 && x < World.YARD_MAX_X && z < World.YARD_MAX_Z;

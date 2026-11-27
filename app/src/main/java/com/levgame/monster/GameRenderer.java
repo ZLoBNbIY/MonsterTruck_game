@@ -18,14 +18,22 @@ import javax.microedition.khronos.opengles.GL10;
 final class GameRenderer implements GLSurfaceView.Renderer {
     private static final float STEP = 1f / 60f;
     private static final int TILE_RADIUS = 4;
+    private static final int CRASH_PARTICLES = 288;
+    private static final int CRASH_RING_SEGMENTS = 16;
+    private static final int CRASH_VERTEX_BYTES = 7 * Float.BYTES;
     private static final float SKY_R = .58f, SKY_G = .80f, SKY_B = .94f;
     private final World world = new World();
+    private final UrbanLife urbanLife = new UrbanLife();
     private final Map<Integer, GpuMesh> tiles = new LinkedHashMap<>(110, .75f, true);
     private final VehicleMesh truck = new VehicleMesh();
-    private final VehicleMesh[] cars = new VehicleMesh[world.traffic.length];
+    private final VehicleMesh[] cars = new VehicleMesh[world.roadBodies.length];
     private static final int TRAFFIC_COLORS = 6;
-    private final GpuMesh[] stock = new GpuMesh[TrafficModel.values().length * TRAFFIC_COLORS];
+    private final GpuMesh[] stock = new GpuMesh[TrafficModel.values().length * 3 * TRAFFIC_COLORS];
     private final Spark[] sparks = new Spark[160];
+    private final CrashParticle[] crashParticles = new CrashParticle[CRASH_PARTICLES];
+    private final FloatBuffer crashVertices = ByteBuffer.allocateDirect(
+            CRASH_PARTICLES * CRASH_RING_SEGMENTS * 6 * CRASH_VERTEX_BYTES)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer();
     private final EnginePuff[] engineSmoke = new EnginePuff[36];
     private final GpuMesh[] engineSmokeMeshes = new GpuMesh[3];
     private final TireMark[] tireMarks = new TireMark[240];
@@ -35,14 +43,16 @@ final class GameRenderer implements GLSurfaceView.Renderer {
     private final float[] projection = new float[16], view = new float[16];
     private final float[] vp = new float[16], mvp = new float[16];
     private final int[] bufferName = new int[1];
-    private int position, tint, transform, haze, opacity, terrain, groundOrigin, softShadow;
-    private GpuMesh sky, truckTire, carTire, distantTire, shadow, sparkMesh, dustMesh, smokeMesh, gritMesh, tireMarkMesh;
+    private int position, tint, transform, haze, opacity, terrain, groundOrigin, softShadow, crashBuffer;
+    private GpuMesh sky, truckTire, carTire, distantTire, shadow, dustMesh, smokeMesh, gritMesh, tireMarkMesh;
     private GpuMesh treeMesh, stumpMesh, garageMesh;
     private final VehicleMesh garageTruck = new VehicleMesh();
     private boolean garage = true;
     private int truckDesign, truckColor = 0xe9351c;
     private float garageAngle = -1.8f;
     private int nextSpark, nextMark;
+    private int nextCrashParticle;
+    private long lastCrashId;
     private int nextEnginePuff;
     private float engineSmokeClock;
     private final float[] previousSuspension = new float[4];
@@ -62,6 +72,7 @@ final class GameRenderer implements GLSurfaceView.Renderer {
     GameRenderer() {
         for (int i = 0; i < cars.length; i++) cars[i] = new VehicleMesh();
         for (int i = 0; i < sparks.length; i++) sparks[i] = new Spark();
+        for (int i = 0; i < crashParticles.length; i++) crashParticles[i] = new CrashParticle();
         for (int i = 0; i < engineSmoke.length; i++) engineSmoke[i] = new EnginePuff();
         for (int i = 0; i < tireMarks.length; i++) tireMarks[i] = new TireMark();
     }
@@ -75,6 +86,7 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         if (enabled) {
             garageAngle = -1.8f;
             clearEngineSmoke();
+            clearCrashEffects();
         }
     }
 
@@ -117,31 +129,28 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         steeringAngle = 0;
         truck.previous.visible = false;
         for (Spark spark : sparks) spark.life = 0;
+        clearCrashEffects();
         clearEngineSmoke();
         for (TireMark mark : tireMarks) mark.life = 0;
         dustClock = 0;
         for (VehicleMesh car : cars) {
             car.previous.visible = false;
-            car.lastDamage = 0;
-            car.lastDetached = 0;
         }
-        truck.lastDamage = 0;
-        truck.lastDetached = 0;
     }
 
     @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) {
-        String vertex = "attribute vec3 aPosition; attribute vec3 aTint;"
+        String vertex = "attribute vec3 aPosition; attribute vec4 aTint;"
                  + "uniform mat4 uTransform; uniform float uHaze; uniform vec2 uGroundOrigin; uniform bool uTerrain;"
-                + "varying mediump vec3 vColor, vGround; varying mediump float vDepth;"
+                 + "varying mediump vec4 vColor; varying mediump vec3 vGround; varying mediump float vDepth;"
                 + "void main(){gl_Position=uTransform*vec4(aPosition,1.0);"
                 + "float fog=smoothstep(85.0,264.0,gl_Position.w)*uHaze;"
                  + "vec2 origin=uTerrain?uGroundOrigin:vec2(0.0);"
                  + "vGround=vec3(aPosition.xz-origin,aPosition.y); vDepth=gl_Position.w;"
-                + "vColor=mix(aTint,vec3(.58,.80,.94),fog);}";
-        String fragment = "precision mediump float; varying vec3 vColor; uniform float uOpacity;"
+                 + "vColor=vec4(mix(aTint.rgb,vec3(.58,.80,.94),fog),aTint.a);}";
+        String fragment = "precision mediump float; varying vec4 vColor; uniform float uOpacity;"
                  + "uniform bool uTerrain, uSoftShadow;"
                  + "varying vec3 vGround; varying float vDepth;"
-                 + "void main(){vec3 color=vColor; float alpha=uOpacity; if(uTerrain){"
+                  + "void main(){vec3 color=vColor.rgb; float alpha=uOpacity*vColor.a; if(uTerrain){"
                  + "vec2 p=fract(floor(mod(vGround.xy,32.0)*11.0)*vec2(.1031,.11369));"
                 + "float grain=fract((p.x+p.y)*fract(p.x*p.y*23.17))-.5;"
                 + "float fade=(1.0-smoothstep(.025,.11,vGround.z))*(1.0-smoothstep(16.0,65.0,vDepth));"
@@ -185,7 +194,8 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         carTire = wheelMesh(36);
         distantTire = wheelMesh(12);
         shadow = shadowMesh();
-        sparkMesh = particleMesh(0xffc45b, 0xffe89f);
+        GLES20.glGenBuffers(1, bufferName, 0);
+        crashBuffer = bufferName[0];
         dustMesh = cloudMesh(0xc39770, 0xe1bb91);
         smokeMesh = cloudMesh(0x939ba9, 0xc3c9d1);
         engineSmokeMeshes[0] = cloudMesh(0xf0f3f5, 0xdbe3eb);
@@ -197,6 +207,7 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         Geometry.Mesh stump = Geometry.stump();
         treeMesh = new GpuMesh(tree.data, tree.count);
         stumpMesh = new GpuMesh(stump.data, stump.count);
+        urbanLife.create(position, tint, transform);
         lastFrame = 0;
     }
 
@@ -219,7 +230,7 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         while (accumulated >= STEP) {
             World.Body player = world.player;
             truck.previous.capture(player);
-            for (int i = 0; i < cars.length; i++) cars[i].previous.capture(world.traffic[i]);
+            for (int i = 0; i < cars.length; i++) cars[i].previous.capture(world.roadBodies[i]);
             for (int i = 0; i < 4; i++) previousSuspension[i] = world.suspensionTravel(i);
             previousSteering = steeringAngle;
             boolean braking = (input & 8) != 0;
@@ -253,9 +264,10 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         GLES20.glUniform1i(terrain, 0);
         drawTireMarks();
         drawTrees();
+        urbanLife.draw(elapsed, cameraX, cameraZ, vp);
         drawVehicle(player, truck, true);
-        for (int i = 0; i < world.traffic.length; i++) {
-            World.Body car = world.traffic[i];
+        for (int i = 0; i < world.roadBodies.length; i++) {
+            World.Body car = world.roadBodies[i];
             if (car.visible && inView(car.x, car.y, car.z, car.model.halfLength + 2f, 189)) {
                 drawVehicle(car, cars[i], false);
             }
@@ -486,7 +498,7 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         float x = lerp(previous.x, body.x, fraction), y = lerp(previous.y, body.y, fraction);
         float z = lerp(previous.z, body.z, fraction), yaw = lerpAngle(previous.yaw, body.yaw, fraction);
         drawShadow(x, z, yaw, isTruck ? 1.95f : body.model.halfWidth + .15f,
-                isTruck ? 2.74f : body.model.halfLength + .15f, .31f / (1 + Math.max(0, y) * .65f));
+                 isTruck ? 2.74f : body.shadowLength(), .31f / (1 + Math.max(0, y) * .65f));
         positionBody(x, y, z, yaw, lerp(previous.pitch, body.pitch, fraction),
                 lerpAngle(previous.roll, body.roll, fraction));
         System.arraycopy(bodyMatrix, 0, model, 0, 16);
@@ -582,9 +594,10 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         int state = ((body.color & 255) << 20) | damageState;
         if (isTruck) return truckMesh(skin, state, front, back, left, right, roof);
         if (damageState == 0 && !body.flattened) {
-            int index = body.model.ordinal() * TRAFFIC_COLORS + Math.floorMod(body.color, TRAFFIC_COLORS);
+            int index = (body.model.ordinal() * 3 + body.part) * TRAFFIC_COLORS + Math.floorMod(body.color, TRAFFIC_COLORS);
             if (stock[index] == null) {
-                Geometry.Mesh mesh = TrafficGeometry.mesh(body.model, body.color, 0, 0, 0, 0, 0, false);
+                Geometry.Mesh mesh = TrafficGeometry.mesh(body.model, body.color, 0, 0, 0, 0, 0, false,
+                        body.part, body.centerZ);
                 stock[index] = new GpuMesh(mesh.data, mesh.count);
             }
             return stock[index];
@@ -592,7 +605,8 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         if (body.flattened) state |= 1 << 28;
         if (skin.gpu == null || skin.state != state) {
             Geometry.Mesh mesh = TrafficGeometry.mesh(body.model, body.color,
-                    front / 15f, back / 15f, left / 15f, right / 15f, roof / 15f, body.flattened);
+                    front / 15f, back / 15f, left / 15f, right / 15f, roof / 15f, body.flattened,
+                    body.part, body.centerZ);
             if (skin.gpu == null) skin.gpu = new GpuMesh(mesh.data, mesh.count);
             else skin.gpu.upload(mesh.data, mesh.count);
             skin.state = state;
@@ -809,11 +823,7 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         }
         for (TireMark mark : tireMarks) if (mark.life > 0) mark.life -= STEP;
         World.Body player = world.player;
-        impact(player, truck);
-        for (int i = 0; i < cars.length; i++) {
-            World.Body car = world.traffic[i];
-            impact(car, cars[i]);
-        }
+        updateCrashEffects();
         wheelEffects(player);
         updateEngineSmoke(player);
     }
@@ -924,25 +934,102 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         }
     }
 
-    private void impact(World.Body body, VehicleMesh skin) {
-        int detached = body.detachedWheels & ~skin.lastDetached;
-        if (body.visible && Math.abs(body.x - world.player.x) + Math.abs(body.z - world.player.z) < 48) {
-            if (body.damage - skin.lastDamage > .025f) {
-                for (int i = 0; i < 6; i++) spawnEffect(body.x, .7f + body.y, body.z, 0);
-            }
-            if (detached != 0) {
-                float fx = (float) Math.sin(body.yaw), fz = (float) Math.cos(body.yaw);
-                for (int i = 0; i < body.axleCount() * 2; i++) {
-                    if ((detached & (1 << i)) == 0) continue;
-                    float x = body.wheelX(i);
-                    float z = body.wheelZ(i);
-                    for (int j = 0; j < 4; j++) spawnEffect(body.x + x*fz + z*fx,
-                            body.y + body.wheelY(), body.z - x*fx + z*fz, 0);
-                }
+    private void clearCrashEffects() {
+        for (CrashParticle particle : crashParticles) particle.life = 0;
+        nextCrashParticle = 0;
+    }
+
+    private void updateCrashEffects() {
+        for (CrashParticle particle : crashParticles) {
+            if (particle.life <= 0) continue;
+            particle.life -= STEP;
+            particle.previousX = particle.x;
+            particle.previousY = particle.y;
+            particle.previousZ = particle.z;
+            particle.x += particle.vx * STEP;
+            particle.y += particle.vy * STEP;
+            particle.z += particle.vz * STEP;
+            if (particle.kind == CrashKind.STREAK || particle.kind == CrashKind.SHARD) {
+                particle.vy -= 15f * STEP;
+                if (particle.y < World.rampHeight(particle.x, particle.z) + .06f) particle.life = 0;
             }
         }
-        skin.lastDamage = body.damage;
-        skin.lastDetached = body.detachedWheels;
+
+        long newest = lastCrashId;
+        int newestSlot = -1;
+        World.CrashEvent[] events = world.crashEvents;
+        for (int i = 0; i < events.length; i++) {
+            if (events[i].id <= newest) continue;
+            newest = events[i].id;
+            newestSlot = i;
+        }
+        if (newestSlot < 0) return;
+        // Start after the newest slot so pending events are emitted oldest first across a wrap.
+        for (int i = 1; i <= events.length; i++) {
+            World.CrashEvent event = events[(newestSlot + i) % events.length];
+            if (event.id > lastCrashId) spawnCrash(event);
+        }
+        lastCrashId = newest;
+    }
+
+    private void spawnCrash(World.CrashEvent event) {
+        boolean crush = event.kind == World.CRASH_CRUSH;
+        boolean hitch = event.kind == World.CRASH_HITCH;
+        float severity = Math.min(1f, (float) Math.sqrt(Math.max(0f, event.energy) / 90_000f));
+        float scale = crush ? 1.45f : .55f + .60f * severity;
+        int accent = crush ? 0xff822e : hitch ? 0xff5894 : 0xffba4c;
+        int material = Geometry.impactShardColor(event.color);
+        float originY = Math.max(event.y, World.rampHeight(event.x, event.z) + .24f);
+
+        spawnCrashParticle(CrashKind.FLASH, event.x, originY + (crush ? .65f : .26f), event.z,
+                crush ? .30f : .20f, scale, accent);
+        if (crush || severity > .48f) {
+            spawnCrashParticle(CrashKind.RING, event.x, originY, event.z,
+                    crush ? .64f : .39f, crush ? 5.4f : 3.3f * scale, accent);
+        }
+
+        int streaks = crush ? 22 : 7 + Math.round(10 * severity);
+        int shards = crush ? 18 : 3 + Math.round(8 * severity);
+        int clouds = crush ? 8 : 3 + Math.round(3 * severity);
+        for (int i = 0; i < streaks + shards + clouds; i++) {
+            boolean streak = i < streaks;
+            boolean cloud = i >= streaks + shards;
+            int color = cloud ? (Geometry.onDirt(event.x, event.z) ? 0xcd926d : 0x998b94)
+                    : streak ? accent : i % 3 == 0 ? 0x79e7f5 : material;
+            float duration = cloud ? .60f + randomEffect(.35f) : .31f + randomEffect(.38f);
+            float size = scale * (cloud ? .60f + randomEffect(.48f) : .075f + randomEffect(.085f));
+            float angle = randomEffect(6.2831855f);
+            float dx = (float) Math.cos(angle), dz = (float) Math.sin(angle);
+            float spread = cloud ? .70f : .38f;
+            CrashKind kind = cloud ? CrashKind.CLOUD : streak ? CrashKind.STREAK : CrashKind.SHARD;
+            CrashParticle particle = spawnCrashParticle(kind, event.x + dx * spread * scale,
+                    originY + randomEffect(.20f), event.z + dz * spread * scale, duration, size, color);
+            float speed = scale * (cloud ? 1.2f + randomEffect(1.8f) : 4f + randomEffect(5.5f));
+            float bias = crush ? 0f : (cloud ? .24f : .65f);
+            particle.vx = (dx + event.nx * bias) * speed;
+            particle.vz = (dz + event.nz * bias) * speed;
+            particle.vy = scale * (cloud ? .62f + randomEffect(.90f) : 2.2f + randomEffect(4.5f));
+        }
+    }
+
+    private CrashParticle spawnCrashParticle(CrashKind kind, float x, float y, float z,
+                                             float life, float size, int color) {
+        CrashParticle particle = crashParticles[nextCrashParticle];
+        nextCrashParticle = (nextCrashParticle + 1) % crashParticles.length;
+        particle.kind = kind;
+        particle.previousX = particle.x = x;
+        particle.previousY = particle.y = y;
+        particle.previousZ = particle.z = z;
+        particle.vx = particle.vy = particle.vz = 0;
+        particle.life = particle.duration = life;
+        particle.size = size;
+        particle.color = color;
+        particle.angle = randomEffect(6.2831855f);
+        return particle;
+    }
+
+    private float randomEffect(float span) {
+        return effects.nextFloat() * span;
     }
 
     private Spark spawnEffect(float x, float y, float z, int kind) {
@@ -1019,18 +1106,135 @@ final class GameRenderer implements GLSurfaceView.Renderer {
             } else {
                 Matrix.rotateM(model, 0, spark.life * 240, 0, 1, 0);
             }
-            float size = dust ? .45f + 1.05f * (.90f - spark.life)
-                    : spark.kind == 2 ? .068f : .09f + .30f * spark.life;
+            float size = dust ? .45f + 1.05f * (.90f - spark.life) : .068f;
             Matrix.scaleM(model, 0, size, size * 1.45f, size);
             GLES20.glUniform1f(opacity, dust ? spark.strength * spark.life * .53f : 1);
             GLES20.glUniform1i(softShadow, dust ? 1 : 0);
-            drawModel(dust ? (spark.smoke ? smokeMesh : dustMesh) : spark.kind == 2 ? gritMesh : sparkMesh);
+            drawModel(dust ? (spark.smoke ? smokeMesh : dustMesh) : gritMesh);
         }
         drawEngineSmoke();
         GLES20.glUniform1i(softShadow, 0);
         GLES20.glUniform1f(opacity, 1);
+        drawCrashEffects();
         GLES20.glDepthMask(true);
         GLES20.glDisable(GLES20.GL_BLEND);
+    }
+
+    private void drawCrashEffects() {
+        crashVertices.clear();
+        for (CrashKind kind : CrashKind.DRAW_ORDER) {
+            // Start at the oldest slot so overlapping bursts draw in spawn order.
+            for (int i = 0; i < crashParticles.length; i++) {
+                CrashParticle particle = crashParticles[(nextCrashParticle + i) % crashParticles.length];
+                if (particle.life <= 0 || particle.kind != kind
+                        || !inView(particle.x, particle.y, particle.z, particle.size + 2, 100)) continue;
+                appendCrashParticle(particle);
+            }
+        }
+        int count = crashVertices.position() / 7;
+        if (count == 0) return;
+        crashVertices.flip();
+        GLES20.glUniformMatrix4fv(transform, 1, false, vp, 0);
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, crashBuffer);
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, count * CRASH_VERTEX_BYTES,
+                crashVertices, GLES20.GL_STREAM_DRAW);
+        GLES20.glVertexAttribPointer(position, 3, GLES20.GL_FLOAT, false, CRASH_VERTEX_BYTES, 0);
+        GLES20.glVertexAttribPointer(tint, 4, GLES20.GL_FLOAT, false, CRASH_VERTEX_BYTES, 12);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, count);
+    }
+
+    private void appendCrashParticle(CrashParticle particle) {
+        float x = lerp(particle.previousX, particle.x, blend);
+        float y = lerp(particle.previousY, particle.y, blend);
+        float z = lerp(particle.previousZ, particle.z, blend);
+        float remaining = particle.life / particle.duration;
+        float age = 1f - remaining;
+        float size = particle.size;
+        int color = particle.color;
+        switch (particle.kind) {
+            case RING:
+                appendImpactRing(x, z, size * (.22f + .78f * age), color, remaining * .83f);
+                break;
+            case CLOUD:
+                appendImpactFan(Geometry.IMPACT_CLOUD, x, y, z, size * (.62f + .92f * age),
+                        particle.angle + age * .6f, color, color,
+                        Math.min(1f, age * 12f + .22f) * remaining * .62f, 0f);
+                break;
+            case FLASH:
+                appendImpactFan(Geometry.IMPACT_FLASH, x, y, z, size * (1.2f + .45f * age),
+                        particle.angle, 0xfffbd0, color, remaining, remaining * .70f);
+                appendImpactFan(Geometry.IMPACT_FLASH, x, y, z, size * .54f,
+                        particle.angle + .18f, 0xffffff, 0xfff1a5, remaining, remaining * .88f);
+                break;
+            case STREAK:
+                float dx = view[0] * particle.vx + view[4] * particle.vy + view[8] * particle.vz;
+                float dy = view[1] * particle.vx + view[5] * particle.vy + view[9] * particle.vz;
+                float angle = (float) Math.atan2(dy, dx);
+                appendCrashChip(x, y, z, angle, size * (2.8f + remaining * 3.0f), size * .42f,
+                        0xfff7b2, color, remaining);
+                break;
+            case SHARD:
+                appendCrashChip(x, y, z, particle.angle + age * 9f, size * 1.5f, size * .80f,
+                        color, blendColor(color, 0x39435a, .48f), Math.min(1f, remaining * 2f));
+                break;
+        }
+    }
+
+    private void appendImpactFan(float[] outline, float x, float y, float z, float size, float angle,
+                                 int centerColor, int edgeColor, float centerAlpha, float edgeAlpha) {
+        float cos = (float) Math.cos(angle) * size, sin = (float) Math.sin(angle) * size;
+        for (int i = 0; i < outline.length; i += 2) {
+            int j = (i + 2) % outline.length;
+            crashPoint(x, y, z, centerColor, centerAlpha);
+            billboardCrashPoint(x, y, z, outline[i] * cos - outline[i + 1] * sin,
+                    outline[i] * sin + outline[i + 1] * cos, edgeColor, edgeAlpha);
+            billboardCrashPoint(x, y, z, outline[j] * cos - outline[j + 1] * sin,
+                    outline[j] * sin + outline[j + 1] * cos, edgeColor, edgeAlpha);
+        }
+    }
+
+    private void appendCrashChip(float x, float y, float z, float angle, float length, float width,
+                                 int leadingColor, int trailingColor, float alpha) {
+        float cos = (float) Math.cos(angle), sin = (float) Math.sin(angle);
+        float dx = cos * length, dy = sin * length;
+        float wx = -sin * width, wy = cos * width;
+        billboardCrashPoint(x, y, z, dx * .28f, dy * .28f, leadingColor, alpha);
+        billboardCrashPoint(x, y, z, wx, wy, leadingColor, alpha);
+        billboardCrashPoint(x, y, z, -wx, -wy, trailingColor, alpha);
+        billboardCrashPoint(x, y, z, -dx, -dy, trailingColor, alpha * .22f);
+        billboardCrashPoint(x, y, z, -wx, -wy, trailingColor, alpha);
+        billboardCrashPoint(x, y, z, wx, wy, leadingColor, alpha);
+    }
+
+    private void appendImpactRing(float x, float z, float radius, int color, float alpha) {
+        float inner = radius * .86f;
+        for (int i = 0; i < CRASH_RING_SEGMENTS; i++) {
+            double a = i * 2 * Math.PI / CRASH_RING_SEGMENTS;
+            double b = (i + 1) * 2 * Math.PI / CRASH_RING_SEGMENTS;
+            float ax = (float) Math.cos(a), az = (float) Math.sin(a);
+            float bx = (float) Math.cos(b), bz = (float) Math.sin(b);
+            ringPoint(x + ax * inner, z + az * inner, color, alpha * .24f);
+            ringPoint(x + ax * radius, z + az * radius, 0xffe5a3, alpha);
+            ringPoint(x + bx * radius, z + bz * radius, 0xffe5a3, alpha);
+            ringPoint(x + ax * inner, z + az * inner, color, alpha * .24f);
+            ringPoint(x + bx * radius, z + bz * radius, 0xffe5a3, alpha);
+            ringPoint(x + bx * inner, z + bz * inner, color, alpha * .24f);
+        }
+    }
+
+    private void ringPoint(float x, float z, int color, float alpha) {
+        crashPoint(x, World.rampHeight(x, z) + .13f, z, color, alpha);
+    }
+
+    private void billboardCrashPoint(float x, float y, float z, float right, float up,
+                                     int color, float alpha) {
+        crashPoint(x + view[0] * right + view[1] * up,
+                y + view[4] * right + view[5] * up, z + view[8] * right + view[9] * up, color, alpha);
+    }
+
+    private void crashPoint(float x, float y, float z, int color, float alpha) {
+        colorPoint(crashVertices, x, y, z, color);
+        crashVertices.put(alpha);
     }
 
     private void drawEngineSmoke() {
@@ -1123,8 +1327,6 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         final Pose previous = new Pose();
         GpuMesh gpu;
         int state;
-        float lastDamage;
-        int lastDetached;
     }
 
     private static final class TireMark {
@@ -1141,5 +1343,18 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         float x, y, z, vx, vy, vz, life, strength;
         int kind;
         boolean smoke;
+    }
+
+    private enum CrashKind {
+        RING, CLOUD, SHARD, STREAK, FLASH;
+
+        static final CrashKind[] DRAW_ORDER = values();
+    }
+
+    private static final class CrashParticle {
+        float x, y, z, previousX, previousY, previousZ, vx, vy, vz;
+        float life, duration, size, angle;
+        int color;
+        CrashKind kind;
     }
 }

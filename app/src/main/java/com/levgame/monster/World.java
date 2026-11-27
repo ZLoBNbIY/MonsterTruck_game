@@ -99,6 +99,10 @@ public final class World {
         public int groundedWheels;
         public boolean visible;
         final TrafficModel model;
+        final int part; // 0: complete vehicle, 1: tractor, 2: trailer
+        final float centerZ;
+        Body trailer, tractor;
+        boolean coupled;
         boolean flattened;
 
         private final float halfWidth, halfLength, invMass, invInertia, radius;
@@ -110,7 +114,14 @@ public final class World {
         private boolean crossing, grounded, parked, overturned, truckContact;
 
         private Body(TrafficModel model, float halfWidth, float halfLength, float mass, float maxHealth) {
+            this(model, halfWidth, halfLength, mass, maxHealth, 0, 0f);
+        }
+
+        private Body(TrafficModel model, float halfWidth, float halfLength, float mass, float maxHealth,
+                     int part, float centerZ) {
             this.model = model;
+            this.part = part;
+            this.centerZ = centerZ;
             this.halfWidth = halfWidth;
             this.halfLength = halfLength;
             this.maxHealth = maxHealth;
@@ -119,9 +130,11 @@ public final class World {
             radius = length(halfWidth, halfLength);
         }
 
-        int axleCount() { return model == null ? 2 : model.axles.length; }
+        int axleCount() { return model == null || part == 2 ? 2 : model.axles.length - (part == 1 ? 2 : 0); }
+        float axleZ(int axle) { return model.axles[axle + (part == 1 ? 2 : 0)] - centerZ; }
         float wheelRadius() { return model == null ? TRUCK_WHEEL_RADIUS : model.wheelRadius; }
         float tireHalfWidth() { return model == null ? TRUCK_WHEEL_HALF_WIDTH : model.halfTireWidth; }
+        float shadowLength() { return halfLength + .15f; }
 
         float wheelX(int index) {
             boolean left = index < axleCount();
@@ -133,9 +146,17 @@ public final class World {
 
         float wheelZ(int index) {
             int axle = index % axleCount();
-            float z = model == null ? (axle == 0 ? -TRUCK_WHEEL_Z : TRUCK_WHEEL_Z) : model.axles[axle];
+            float z = model == null ? (axle == 0 ? -TRUCK_WHEEL_Z : TRUCK_WHEEL_Z) : axleZ(axle);
             return z - Math.copySign(.20f, z) * (z < 0f ? dentBack : dentFront);
         }
+    }
+
+    public static final int CRASH_HIT = 1, CRASH_CRUSH = 2, CRASH_HITCH = 3;
+
+    public static final class CrashEvent {
+        public long id;
+        public float x, y, z, nx, nz, energy;
+        public int color, kind;
     }
 
     public static final class LooseWheel {
@@ -186,6 +207,9 @@ public final class World {
 
     public final Body player = new Body(null, TRUCK_HALF_WIDTH, TRUCK_HALF_LENGTH, TRUCK_MASS, TRUCK_MAX_HEALTH);
     public final Body[] traffic = new Body[192];
+    final Body[] roadBodies;
+    public final CrashEvent[] crashEvents = new CrashEvent[32];
+    private long crashSequence;
     public final LooseWheel[] looseWheels = new LooseWheel[64];
     public int crushed;
 
@@ -211,11 +235,25 @@ public final class World {
     float suspensionTravel(int wheel) { return suspensionTravel[wheel]; }
 
     public World() {
+        List<Body> bodies = new ArrayList<>();
         for (int i = 0; i < traffic.length; i++) {
             TrafficModel model = FLEET[i % FLEET.length];
-            traffic[i] = new Body(model, model.halfWidth, model.halfLength, model.mass,
-                    CAR_MAX_HEALTH * (model.isPassengerCar() ? 1f : 1.6f));
+            float health = CAR_MAX_HEALTH * (model.isPassengerCar() ? 1f : 1.6f);
+            float length = model.halfLength;
+            Body car = model.hasTrailer()
+                    ? new Body(model, model.halfWidth, length * .28f, model.mass * .46f, health, 1, length * .72f)
+                    : new Body(model, model.halfWidth, length, model.mass, health);
+            traffic[i] = car;
+            bodies.add(car);
+            if (model.hasTrailer()) {
+                car.trailer = new Body(model, model.halfWidth, length * .67f, model.mass * .54f,
+                        health, 2, -length * .33f);
+                car.trailer.tractor = car;
+                bodies.add(car.trailer);
+            }
         }
+        roadBodies = bodies.toArray(new Body[0]);
+        Arrays.setAll(crashEvents, i -> new CrashEvent());
         Arrays.setAll(looseWheels, i -> new LooseWheel());
         reset();
     }
@@ -315,7 +353,8 @@ public final class World {
         recycleTicks = recycleIndex = crushed = 0;
         nextLooseWheel = 0;
         for (LooseWheel wheel : looseWheels) wheel.visible = false;
-        for (Body car : traffic) clear(car);
+        for (Body car : roadBodies) clear(car);
+        for (CrashEvent event : crashEvents) event.id = 0;
         clear(player);
         player.x = SPAWN_X;
         player.y = RIDE_HEIGHT;
@@ -347,6 +386,7 @@ public final class World {
         b.color = b.gx = b.gz = b.direction = b.nextDirection = b.curveSample = b.blockedTicks = 0;
         b.reserved = -1;
         b.visible = b.crossing = b.flattened = b.parked = b.overturned = b.truckContact = false;
+        b.coupled = false;
         b.grounded = true;
     }
 
@@ -417,7 +457,14 @@ public final class World {
 
         indexTraffic();
         for (Body car : traffic) if (car.visible) driveTraffic(car);
-        for (Body car : traffic) if (car.visible) move(car);
+        for (Body car : traffic) {
+            Body trailer = car.trailer;
+            if (trailer != null && trailer.visible) {
+                driveTrailer(trailer);
+                if (car.coupled) constrainHitch(car);
+            }
+        }
+        for (Body car : roadBodies) if (car.visible) move(car);
         float oldX = player.x, oldZ = player.z;
         move(player);
         blockRampWalls(oldX, oldZ);
@@ -425,21 +472,22 @@ public final class World {
 
         // At the speed cap a vehicle moves less than half a metre per tick,
         // smaller than a car's half-width and the thinnest static collider.
-        for (int i = 0; i < traffic.length; i++) {
-            Body car = traffic[i];
+        for (int i = 0; i < roadBodies.length; i++) {
+            Body car = roadBodies[i];
             if (!car.visible) continue;
-            if (player.y < carHeight(car) + .25f && !car.truckContact && !canClimb(car)) {
+            if (player.y < car.y + carHeight(car) + .25f && !car.truckContact && !canClimb(car)) {
                 collide(player, car);
             }
-            for (int j = i + 1; j < traffic.length; j++) {
-                Body other = traffic[j];
-                if (other.visible) collide(car, other);
+            for (int j = i + 1; j < roadBodies.length; j++) {
+                Body other = roadBodies[j];
+                if (other.visible && !(car.coupled && other == car.trailer)) collide(car, other);
             }
         }
         scenery(player);
         collideTrees();
         moveTrees();
-        for (Body car : traffic) if (car.visible) scenery(car);
+        for (Body car : roadBodies) if (car.visible) scenery(car);
+        for (Body car : traffic) if (car.coupled) constrainHitch(car);
         for (LooseWheel wheel : looseWheels) if (wheel.visible) moveLooseWheel(wheel);
         if (++recycleTicks == 15) {
             recycleTicks = 0;
@@ -500,10 +548,10 @@ public final class World {
             }
             truckSupports[i] = null;
         }
-        for (Body car : traffic) {
+        for (Body car : roadBodies) {
             float reach = car.radius + 3.75f;
             if (!car.visible || distanceSq(player.x, player.z, car.x, car.z) > reach * reach
-                    || (!car.truckContact && !canClimb(car) && player.y < carHeight(car))) continue;
+                    || (!car.truckContact && !canClimb(car) && player.y < car.y + carHeight(car))) continue;
             float bf = sin(car.yaw), bc = cos(car.yaw);
             float height = carHeight(car);
             for (int i = 0; i < 4; i++) {
@@ -656,7 +704,7 @@ public final class World {
     }
 
     private void loadCars(float landingSpeed) {
-        for (Body car : traffic) {
+        for (Body car : roadBodies) {
             float reach = car.radius + 3.75f;
             if (!car.visible || distanceSq(player.x, player.z, car.x, car.z) > reach * reach) {
                 car.truckContact = false;
@@ -699,11 +747,26 @@ public final class World {
                 }
             }
             car.truckContact |= load > .14f;
-            if (!car.flattened && (load > .42f || (load > .16f && landingSpeed > 3.5f))) crush(car);
+            if (!car.flattened && car.model.isPassengerCar()
+                    && (load > .42f || (load > .16f && landingSpeed > 3.5f))) crush(car);
+            if (load > .16f && !car.model.isPassengerCar() && landingSpeed > 3.5f) {
+                float energy = .24f * landingSpeed * landingSpeed / player.invMass;
+                float amount = dentAmount(car, energy);
+                if (amount > 0f) {
+                    car.dentRoof = Math.min(1f, car.dentRoof + amount);
+                    recordDent(car, amount);
+                    impactHealth(car, energy);
+                    crash(CRASH_HIT, car.x, car.y + carHeight(car), car.z, 0f, 0f, energy, car.color);
+                    detachHitch(car, energy, 0f, 0f);
+                }
+            }
         }
     }
 
     private void crush(Body car) {
+        float speed = length(player.vx - car.vx, player.vz - car.vz);
+        crash(CRASH_CRUSH, car.x, car.y + .85f, car.z, sin(player.yaw), cos(player.yaw),
+                18000f + speed * speed * 500f, car.color);
         car.flattened = true;
         car.health = 0f;
         crushed++;
@@ -718,19 +781,25 @@ public final class World {
 
     private void driveTraffic(Body car) {
         int missing = car.detachedWheels;
-        boolean disabled = (missing != 0 || car.health <= 0f) && !car.parked && !car.flattened;
+        boolean heavy = !car.model.isPassengerCar();
+        boolean disabled = (missing != 0 || car.health <= 0f || car.overturned)
+                && !car.parked && !car.flattened;
         float roll = 0f, pitch = 0f;
         if (missing != 0 && !car.flattened) {
             int axles = car.axleCount();
             for (int i = 0; i < axles * 2; i++) {
                 if ((missing & (1 << i)) == 0) continue;
                 roll += (i < axles ? .09f : -.09f) / axles;
-                pitch += Math.copySign(.05f / axles, car.model.axles[i % axles]);
+                pitch += Math.copySign(.05f / axles, car.axleZ(i % axles));
             }
         }
-        car.roll += (roll - car.roll) * 5f * TICK;
-        car.pitch += (pitch - car.pitch) * 5f * TICK;
+        if (heavy) heavyPose(car, roll, pitch);
+        else {
+            car.roll += (roll - car.roll) * 5f * TICK;
+            car.pitch += (pitch - car.pitch) * 5f * TICK;
+        }
         if (disabled) {
+            release(car);
             car.blockedTicks++;
             drive(car, 0f, 6f, 4f, 43f, 43f);
             return;
@@ -796,7 +865,10 @@ public final class World {
                 targetZ = endZ + nz * lookAhead;
             }
             float exitLateral = (car.x - endX) * nz - (car.z - endZ) * nx;
-            if (car.curveSample == 8 && exitProgress >= car.halfLength - 2f && Math.abs(exitLateral) < 2f) {
+            Body tail = car.coupled ? car.trailer : car;
+            float tailProgress = (tail.x - endX) * nx + (tail.z - endZ) * nz
+                    - projection(nx, nz, sin(tail.yaw), cos(tail.yaw), tail.halfWidth, tail.halfLength);
+            if (car.curveSample == 8 && tailProgress >= -2f && Math.abs(exitLateral) < 2f) {
                 release(car);
                 car.crossing = false;
                 car.blockedTicks = 0;
@@ -825,7 +897,8 @@ public final class World {
         for (int row = minZ; row <= maxZ; row++) {
             for (int col = minX; col <= maxX; col++) {
                 for (Body lead = trafficCells[row * GRID + col]; lead != null; lead = lead.nextInTrafficCell) {
-                    if (lead == car || lead.y >= .85f) continue;
+                    if (lead == car || (car.coupled && lead == car.trailer)
+                            || (lead.y >= .85f && !lead.overturned)) continue;
                     float px = lead.x - car.x, pz = lead.z - car.z;
                     float along = px * fx + pz * fz;
                     float lateral = Math.abs(px * fz - pz * fx);
@@ -849,10 +922,70 @@ public final class World {
         return Math.min(acceleration, Math.max(-12f, following));
     }
 
+    private static void heavyPose(Body body, float roll, float pitch) {
+        float side = Math.abs(body.roll);
+        if (side > 1.02f) body.overturned = true;
+        if (side < .48f) body.overturned = false;
+        float rest = body.overturned ? Math.copySign(1.53f, body.roll) : roll;
+        body.rollSpeed = clamp(body.rollSpeed + ((rest - body.roll) * 8f - body.rollSpeed * 3.2f) * TICK, -5f, 5f);
+        body.pitchSpeed = clamp(body.pitchSpeed + ((pitch - body.pitch) * 14f - body.pitchSpeed * 5f) * TICK, -3f, 3f);
+        body.roll = clamp(body.roll + body.rollSpeed * TICK, -1.65f, 1.65f);
+        body.pitch = clamp(body.pitch + body.pitchSpeed * TICK, -.28f, .28f);
+        float sinRoll = Math.abs(sin(body.roll)), cosRoll = cos(body.roll);
+        float wheelLift = sinRoll * body.model.wheelX + (cosRoll - 1f) * body.wheelRadius();
+        float sillLift = sinRoll * body.halfWidth - cosRoll * .55f;
+        float endLift = Math.abs(sin(body.pitch)) * Math.min(body.halfLength, 3f);
+        body.y = Math.max(0f, Math.max(wheelLift, sillLift) + endLift);
+    }
+
+    private static void driveTrailer(Body trailer) {
+        boolean attached = trailer.tractor.coupled;
+        heavyPose(trailer, 0f, attached ? 0f : .13f);
+        drive(trailer, 0f, trailer.overturned ? 6f : attached ? 0f : 2f, .4f, 35f, 25f);
+        // Concentrate side grip at the trailer bogie so it follows the hitch around corners.
+        float f = sin(trailer.yaw), c = cos(trailer.yaw);
+        float axle = (trailer.axleZ(0) + trailer.axleZ(1)) * .5f;
+        float slip = trailer.vx * c - trailer.vz * f + axle * trailer.spin;
+        float sideForce = -slip * Math.min(1f, (trailer.overturned ? 2f : 12f) * TICK)
+                / (trailer.invMass + axle * axle * trailer.invInertia);
+        impulse(trailer, c * sideForce, -f * sideForce, f * axle, c * axle);
+    }
+
+    private static void constrainHitch(Body tractor) {
+        Body trailer = tractor.trailer;
+        float hitch = tractor.model.halfLength * .42f;
+        float ra = hitch - tractor.centerZ, rb = hitch - trailer.centerZ;
+        float ax = sin(tractor.yaw) * ra, az = cos(tractor.yaw) * ra;
+        float bx = sin(trailer.yaw) * rb, bz = cos(trailer.yaw) * rb;
+        float ex = (trailer.x + bx) - (tractor.x + ax);
+        float ez = (trailer.z + bz) - (tractor.z + az);
+        float vx = trailer.vx + trailer.spin * bz - tractor.vx - tractor.spin * az;
+        float vz = trailer.vz - trailer.spin * bx - tractor.vz + tractor.spin * ax;
+        float mass = tractor.invMass + trailer.invMass;
+        float xx = mass + az * az * tractor.invInertia + bz * bz * trailer.invInertia;
+        float zz = mass + ax * ax * tractor.invInertia + bx * bx * trailer.invInertia;
+        float xz = -ax * az * tractor.invInertia - bx * bz * trailer.invInertia;
+        float det = xx * zz - xz * xz;
+        vx += clamp(ex * 16f, -6f, 6f);
+        vz += clamp(ez * 16f, -6f, 6f);
+        float jx = (zz * vx - xz * vz) / det;
+        float jz = (xx * vz - xz * vx) / det;
+        impulse(tractor, jx, jz, ax, az);
+        impulse(trailer, -jx, -jz, bx, bz);
+
+        float angle = wrap(trailer.yaw - tractor.yaw);
+        if (Math.abs(angle) > 1.08f) {
+            float excess = angle - Math.copySign(1.08f, angle);
+            float torque = (excess * 15f + trailer.spin - tractor.spin) / (tractor.invInertia + trailer.invInertia);
+            tractor.spin += torque * tractor.invInertia;
+            trailer.spin -= torque * trailer.invInertia;
+        }
+    }
+
     private void indexTraffic() {
         Arrays.fill(trafficCells, null);
         addToTrafficCell(player);
-        for (Body car : traffic) if (car.visible) addToTrafficCell(car);
+        for (Body car : roadBodies) if (car.visible) addToTrafficCell(car);
     }
 
     private void addToTrafficCell(Body body) {
@@ -867,8 +1000,9 @@ public final class World {
 
     private boolean crossingFree(Body car, float cx, float cz) {
         for (Body other = trafficCells[car.gz * GRID + car.gx]; other != null; other = other.nextInTrafficCell) {
-            if (other == car || other.y >= .85f || (other.model != null
-                    && other.detachedWheels == 0 && other.health > 0f)) continue;
+            if (other == car || other == car.trailer || (other.model != null && !other.overturned
+                    && other.detachedWheels == 0 && other.health > 0f
+                    && (other.tractor == null || other.tractor.coupled))) continue;
             float dx = Math.abs(other.x - cx), dz = Math.abs(other.z - cz);
             float margin = ROAD * .5f + other.radius;
             if (dx >= margin || dz >= margin) continue;
@@ -881,13 +1015,13 @@ public final class World {
 
     private boolean exitFree(Body car, float cx, float cz) {
         int dx = DX[car.nextDirection], dz = DZ[car.nextDirection];
-        for (int i = -1; i < traffic.length; i++) {
-            Body other = i < 0 ? player : traffic[i];
-            if (other == car || !other.visible || other.y >= 0.85f) continue;
+        for (int i = -1; i < roadBodies.length; i++) {
+            Body other = i < 0 ? player : roadBodies[i];
+            if (other == car || other == car.trailer || !other.visible || (other == player && other.y >= .85f)) continue;
             float x = other.x - cx, z = other.z - cz;
             float along = x * dx + z * dz;
             float lateral = x * dz - z * dx - LANE;
-            float exitEnd = JUNCTION + car.halfLength * 2f + 3f;
+            float exitEnd = JUNCTION + (car.coupled ? car.model.halfLength : car.halfLength) * 2f + 3f;
             if (along + other.radius < JUNCTION - 2f || along - other.radius > exitEnd
                     || Math.abs(lateral) > car.halfWidth + other.radius + .3f) continue;
             float f = sin(other.yaw), c = cos(other.yaw);
@@ -929,8 +1063,8 @@ public final class World {
             float distance = distanceSq(x, z, player.x, player.z);
             if (distance < near * near || distance > far * far) continue;
             boolean clear = true;
-            for (Body other : traffic) {
-                if (other != car && other.visible && spawnOverlaps(car, x, z, dx, dz, other)) {
+            for (Body other : roadBodies) {
+                if (other != car && other != car.trailer && other.visible && spawnOverlaps(car, x, z, dx, dz, other)) {
                     clear = false;
                     break;
                 }
@@ -938,8 +1072,8 @@ public final class World {
             if (!clear || spawnOverlaps(car, x, z, dx, dz, player)) continue;
             release(car);
             clear(car);
-            car.x = x;
-            car.z = z;
+            car.x = x + dx * car.centerZ;
+            car.z = z + dz * car.centerZ;
             car.gx = gx;
             car.gz = gz;
             car.direction = direction;
@@ -950,6 +1084,17 @@ public final class World {
             car.vz = dz * car.cruise * 0.65f;
             car.color = (index + index / FLEET.length) % 6;
             car.visible = true;
+            if (car.trailer != null) {
+                Body trailer = car.trailer;
+                clear(trailer);
+                trailer.x = x + dx * trailer.centerZ;
+                trailer.z = z + dz * trailer.centerZ;
+                trailer.yaw = car.yaw;
+                trailer.vx = car.vx;
+                trailer.vz = car.vz;
+                trailer.color = car.color;
+                car.coupled = trailer.visible = true;
+            }
             return true;
         }
         return false;
@@ -957,10 +1102,10 @@ public final class World {
 
     private static boolean spawnOverlaps(Body car, float x, float z, int dx, int dz, Body other) {
         float px = other.x - x, pz = other.z - z;
-        float reach = car.radius + other.radius + 3f;
+        float reach = length(car.halfWidth, car.model.halfLength) + other.radius + 3f;
         if (px * px + pz * pz > reach * reach) return false;
         float f = sin(other.yaw), c = cos(other.yaw);
-        return Math.abs(px * dx + pz * dz) < car.halfLength + 2.5f
+        return Math.abs(px * dx + pz * dz) < car.model.halfLength + 2.5f
                         + projection(dx, dz, f, c, other.halfWidth, other.halfLength)
                 && Math.abs(px * dz - pz * dx) < car.halfWidth + .45f
                         + projection(dz, -dx, f, c, other.halfWidth, other.halfLength);
@@ -973,7 +1118,9 @@ public final class World {
             if (recycleIndex == traffic.length - TARGETS.length) recycleIndex = 0;
             Body car = traffic[index];
             float far = car.flattened ? 360f : car.blockedTicks > 14 * 120 ? 100f : 500f;
-            if (!car.visible || distanceSq(player.x, player.z, car.x, car.z) > far * far) {
+            if ((!car.visible || distanceSq(player.x, player.z, car.x, car.z) > far * far)
+                    && (car.trailer == null || !car.trailer.visible || car.coupled
+                        || distanceSq(player.x, player.z, car.trailer.x, car.trailer.z) > 140f * 140f)) {
                 place(car, index, 205f, 335f, 40);
             }
         }
@@ -1286,6 +1433,8 @@ public final class World {
 
             if (closing > 2.5f) {
                 float energy = 0.5f * closing * closing * (1f - restitution * restitution) / invEffective;
+                rockHeavy(a, -nx, -nz, normalImpulse);
+                if (b != null) rockHeavy(b, nx, nz, normalImpulse);
                 dentImpact(a, nx, nz, energy);
                 breakWheels(a, ax, az, nx, nz, energy);
                 impactHealth(a, energy);
@@ -1293,6 +1442,11 @@ public final class World {
                     dentImpact(b, -nx, -nz, energy);
                     breakWheels(b, bx, bz, -nx, -nz, energy);
                     impactHealth(b, energy);
+                }
+                if (a == player && energy > IMPACT_DAMAGE_THRESHOLD) {
+                    float height = b == null ? player.y + 1f : b.y + Math.min(1.35f, carHeight(b) * .7f);
+                    crash(CRASH_HIT, x, height, z, nx, nz, energy, b == null ? -1 : b.color);
+                    if (b != null) detachHitch(b, energy, nx, nz);
                 }
             }
         }
@@ -1304,6 +1458,36 @@ public final class World {
             b.x += nx * correction * invB;
             b.z += nz * correction * invB;
         }
+    }
+
+    private static void rockHeavy(Body body, float nx, float nz, float impulse) {
+        if (body.model == null || body.model.isPassengerCar()) return;
+        float f = sin(body.yaw), c = cos(body.yaw);
+        float kick = impulse * body.invMass;
+        body.rollSpeed -= (nx * c - nz * f) * kick * .48f;
+        body.pitchSpeed += (nx * f + nz * c) * kick * .21f;
+    }
+
+    private void detachHitch(Body part, float energy, float nx, float nz) {
+        Body tractor = part.tractor == null ? part : part.tractor;
+        if (!tractor.coupled || energy < 7500f) return;
+        tractor.coupled = false;
+        float offset = tractor.model.halfLength * .42f - tractor.centerZ;
+        crash(CRASH_HITCH, tractor.x + sin(tractor.yaw) * offset, .94f + tractor.y,
+                tractor.z + cos(tractor.yaw) * offset, nx, nz, energy, tractor.color);
+    }
+
+    private void crash(int kind, float x, float y, float z, float nx, float nz, float energy, int color) {
+        CrashEvent event = crashEvents[(int) (crashSequence % crashEvents.length)];
+        event.x = x;
+        event.y = y;
+        event.z = z;
+        event.nx = nx;
+        event.nz = nz;
+        event.energy = energy;
+        event.color = color;
+        event.kind = kind;
+        event.id = ++crashSequence;
     }
 
     private static void impulse(Body b, float ix, float iz, float rx, float rz) {
@@ -1371,7 +1555,7 @@ public final class World {
         if (sideHit && axles > 2) {
             float hitZ = localZ * body.halfLength;
             for (int i = 0; i < axles; i++) {
-                if (Math.abs(body.model.axles[i] - hitZ) < Math.abs(body.model.axles[axle] - hitZ)) axle = i;
+                if (Math.abs(body.axleZ(i) - hitZ) < Math.abs(body.axleZ(axle) - hitZ)) axle = i;
             }
         }
         float kick = clamp((float) Math.sqrt(energy / CAR_WHEEL_BREAK_ENERGY), 1f, 3f);
