@@ -393,33 +393,48 @@ final class Geometry {
 
     private static void paintRibbon(Builder mesh, VehiclePanel surface, int axis, int side,
                                     float[][] edges, int base, int highlight) {
-        float[][] previous = new float[2][3], current = new float[2][3];
-        float[] param = new float[3];
-        param[axis] = side;
-        int steps = (edges.length - 1) * 6;
+        int across = 6, perSegment = 10;
+        float[][] previous = new float[across + 1][3], current = new float[across + 1][3];
+        float[] boundaries = new float[4];
+        int[] colors = new int[across + 1];
+        for (int i = 0; i <= across; i++) colors[i] = mixPaint(base, highlight, i / (float) across);
+        int steps = (edges.length - 1) * perSegment;
         for (int step = 0; step <= steps; step++) {
-            int segment = Math.min(edges.length - 2, step / 6);
-            float t = (step - segment * 6) / 6f;
+            int segment = Math.min(edges.length - 2, step / perSegment);
+            float t = (step - segment * perSegment) / (float) perSegment;
             float[] a = edges[Math.max(0, segment - 1)], b = edges[segment];
             float[] c = edges[segment + 1], d = edges[Math.min(edges.length - 1, segment + 2)];
-            for (int edge = 0; edge < 2; edge++) {
-                for (int coordinate = 0; coordinate < 2; coordinate++) {
-                    int i = edge * 2 + coordinate;
-                    float incoming = .5f * (c[i] - a[i]);
-                    float outgoing = .5f * (d[i] - b[i]);
-                    param[(axis + 1 + coordinate) % 3] = b[i] + (c[i] - b[i]) * smooth(t)
-                            + t * (1 - t) * ((1 - t) * incoming - t * outgoing);
-                }
-                surface.point(param, current[edge], axis, side == 0 ? -.021f : .021f);
+            for (int i = 0; i < boundaries.length; i++) {
+                float incoming = .5f * (c[i] - a[i]);
+                float outgoing = .5f * (d[i] - b[i]);
+                boundaries[i] = b[i] + (c[i] - b[i]) * smooth(t)
+                        + t * (1 - t) * ((1 - t) * incoming - t * outgoing);
+            }
+            for (int i = 0; i <= across; i++) {
+                float f = i / (float) across;
+                surface.paintPoint(axis, side, boundaries[0] + f * (boundaries[2] - boundaries[0]),
+                        boundaries[1] + f * (boundaries[3] - boundaries[1]), current[i]);
             }
             if (step > 0) {
-                mesh.triangle(previous[0], current[0], current[1], base, base, highlight);
-                mesh.triangle(previous[0], current[1], previous[1], base, highlight, highlight);
+                for (int i = 0; i < across; i++) {
+                    mesh.triangle(previous[i], current[i], current[i + 1], colors[i], colors[i], colors[i + 1]);
+                    mesh.triangle(previous[i], current[i + 1], previous[i + 1],
+                            colors[i], colors[i + 1], colors[i + 1]);
+                }
             }
             float[][] swap = previous;
             previous = current;
             current = swap;
         }
+    }
+
+    private static int mixPaint(int base, int highlight, float fraction) {
+        int color = 0;
+        for (int shift = 0; shift <= 16; shift += 8) {
+            int start = (base >> shift) & 255, end = (highlight >> shift) & 255;
+            color |= Math.round(start + (end - start) * fraction) << shift;
+        }
+        return color;
     }
 
     private static void truckChassis(Builder mesh, Deformation shape) {
@@ -633,6 +648,7 @@ final class Geometry {
         private final int paint;
         private final float[] origin, span, bevel, border;
         private final float[][] grid = new float[3][];
+        private final float[][][] paintFaces;
 
         VehiclePanel(Deformation shape, Panel kind, int paint, float[] origin, float[] span,
                      float[] bevel) {
@@ -642,6 +658,7 @@ final class Geometry {
             this.origin = origin;
             this.span = span;
             this.bevel = bevel;
+            paintFaces = kind == Panel.BODY && shape.truck ? new float[4][][] : null;
             border = new float[3];
             for (int axis = 0; axis < 3; axis++) {
                 bevel[axis] = Math.min(bevel[axis], span[axis] * .47f);
@@ -736,6 +753,7 @@ final class Geometry {
                     }
                 }
             }
+            if (paintFaces != null && axis < 2) paintFaces[axis * 2 + side] = points;
             for (int i = 0; i + 1 < u.length; i++) {
                 for (int j = 0; j + 1 < v.length; j++) {
                     int a = i * v.length + j, b = a + v.length, c = b + 1, d = a + 1;
@@ -756,6 +774,26 @@ final class Geometry {
                     }
                 }
             }
+        }
+
+        void paintPoint(int axis, int side, float uAt, float vAt, float[] out) {
+            // Follow the actual deformed triangles, including the creases across the hood.
+            float[] u = grid[(axis + 1) % 3], v = grid[(axis + 2) % 3];
+            int i = gridCell(u, uAt), j = gridCell(v, vAt);
+            float s = (uAt - u[i]) / (u[i + 1] - u[i]);
+            float t = (vAt - v[j]) / (v[j + 1] - v[j]);
+            float[][] points = paintFaces[axis * 2 + side];
+            int index = i * v.length + j;
+            float[] a = points[index], c = points[index + v.length + 1];
+            float[] b = points[index + (s >= t ? v.length : 1)];
+            float low = Math.min(s, t), high = Math.max(s, t);
+            for (int k = 0; k < 3; k++) out[k] = a[k] * (1 - high) + b[k] * (high - low) + c[k] * low;
+            out[axis] += side == 0 ? -.014f : .014f;
+        }
+
+        private static int gridCell(float[] grid, float at) {
+            int index = Arrays.binarySearch(grid, at);
+            return index >= 0 ? Math.min(index, grid.length - 2) : Math.max(0, -index - 2);
         }
 
         private int material(int axis, float[] param) {
@@ -802,10 +840,6 @@ final class Geometry {
         }
 
         private void point(float[] param, float[] out) {
-            point(param, out, -1, 0);
-        }
-
-        private void point(float[] param, float[] out, int offsetAxis, float offset) {
             // Project the corner of the parametric box onto an ellipsoidal fillet.
             float lengthSquared = 0;
             for (int k = 0; k < 3; k++) {
@@ -859,8 +893,7 @@ final class Geometry {
                 z += (shape.truck ? .14f : .105f) * (2 * along - 1)
                         * (1 - across * across) * ridge(height - .47f, .53f);
             }
-            shape.apply(x + (offsetAxis == 0 ? offset : 0),
-                    y + (offsetAxis == 1 ? offset : 0), z, out);
+            shape.apply(x, y, z, out);
         }
     }
 
