@@ -23,7 +23,8 @@ final class GameRenderer implements GLSurfaceView.Renderer {
     private final Map<Integer, GpuMesh> tiles = new LinkedHashMap<>(110, .75f, true);
     private final VehicleMesh truck = new VehicleMesh();
     private final VehicleMesh[] cars = new VehicleMesh[world.traffic.length];
-    private final GpuMesh[] stock = new GpuMesh[32];
+    private static final int TRAFFIC_COLORS = 6;
+    private final GpuMesh[] stock = new GpuMesh[TrafficModel.values().length * TRAFFIC_COLORS];
     private final Spark[] sparks = new Spark[160];
     private final EnginePuff[] engineSmoke = new EnginePuff[36];
     private final GpuMesh[] engineSmokeMeshes = new GpuMesh[3];
@@ -255,7 +256,9 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         drawVehicle(player, truck, true);
         for (int i = 0; i < world.traffic.length; i++) {
             World.Body car = world.traffic[i];
-            if (car.visible && inView(car.x, car.y, car.z, 8, 189)) drawVehicle(car, cars[i], false);
+            if (car.visible && inView(car.x, car.y, car.z, car.model.halfLength + 2f, 189)) {
+                drawVehicle(car, cars[i], false);
+            }
         }
         for (World.LooseWheel wheel : world.looseWheels) {
             if (wheel.visible && inView(wheel.x, wheel.y, wheel.z, 2, 118)) drawLooseWheel(wheel);
@@ -351,7 +354,7 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         Matrix.setRotateM(bodyMatrix, 0, degrees(garageAngle), 0, 1, 0);
         System.arraycopy(bodyMatrix, 0, model, 0, 16);
         drawModel(vehicleMesh(null, garageTruck, true));
-        drawWheels(null, true, truckTire, 0, 1);
+        drawTruckWheels(null, 0, 1);
     }
 
     private GpuMesh garageMesh() {
@@ -482,16 +485,35 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         float fraction = previous.fraction(body, blend);
         float x = lerp(previous.x, body.x, fraction), y = lerp(previous.y, body.y, fraction);
         float z = lerp(previous.z, body.z, fraction), yaw = lerpAngle(previous.yaw, body.yaw, fraction);
-        drawShadow(x, z, yaw, isTruck ? 1.95f : 1.09f,
-                isTruck ? 2.74f : 2.06f, .31f / (1 + Math.max(0, y) * .65f));
+        drawShadow(x, z, yaw, isTruck ? 1.95f : body.model.halfWidth + .15f,
+                isTruck ? 2.74f : body.model.halfLength + .15f, .31f / (1 + Math.max(0, y) * .65f));
         positionBody(x, y, z, yaw, lerp(previous.pitch, body.pitch, fraction),
                 lerpAngle(previous.roll, body.roll, fraction));
         System.arraycopy(bodyMatrix, 0, model, 0, 16);
         drawModel(vehicleMesh(body, skin, isTruck));
 
         float dx = x - cameraX, dz = z - cameraZ;
-        GpuMesh tire = isTruck ? truckTire : dx*dx + dz*dz < 45*45 ? carTire : distantTire;
-        drawWheels(body, isTruck, tire, lerpAngle(previous.wheelSpin, body.wheelSpin, fraction), fraction);
+        GpuMesh tire = dx*dx + dz*dz < 45*45 ? carTire : distantTire;
+        float spin = lerpAngle(previous.wheelSpin, body.wheelSpin, fraction);
+        if (isTruck) drawTruckWheels(body, spin, fraction);
+        else drawTrafficWheels(body, tire, spin);
+    }
+
+    private void drawTrafficWheels(World.Body body, GpuMesh tire, float spin) {
+        for (int i = 0; i < body.axleCount() * 2; i++) {
+            if ((body.detachedWheels & (1 << i)) != 0) continue;
+            System.arraycopy(bodyMatrix, 0, model, 0, 16);
+            float z = body.wheelZ(i);
+            Matrix.translateM(model, 0, body.wheelX(i), body.wheelY(), z);
+            boolean left = i < body.axleCount();
+            float bend = left ? body.dentLeft : body.dentRight;
+            float endDent = z < 0f ? body.dentBack : body.dentFront;
+            Matrix.rotateM(model, 0, (left ? -1f : 1f) * (bend * 21f + endDent * 7f), 0, 1, 0);
+            Matrix.rotateM(model, 0, degrees(spin), 1, 0, 0);
+            float radius = body.wheelRadius();
+            Matrix.scaleM(model, 0, body.tireHalfWidth(), radius, radius);
+            drawModel(tire);
+        }
     }
 
     private void positionBody(float x, float y, float z, float yaw, float pitch, float roll) {
@@ -502,7 +524,7 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         Matrix.rotateM(bodyMatrix, 0, degrees(roll), 0, 0, 1);
     }
 
-    private void drawWheels(World.Body body, boolean isTruck, GpuMesh tire, float wheelSpin, float fraction) {
+    private void drawTruckWheels(World.Body body, float wheelSpin, float fraction) {
         for (int side = -1; side <= 1; side += 2) {
             for (int axle = -1; axle <= 1; axle += 2) {
                 int index = (side < 0 ? 0 : 2) + (axle < 0 ? 0 : 1);
@@ -510,19 +532,16 @@ final class GameRenderer implements GLSurfaceView.Renderer {
                 System.arraycopy(bodyMatrix, 0, model, 0, 16);
                 float bend = body == null ? 0 : side < 0 ? body.dentLeft : body.dentRight;
                 float endDent = body == null ? 0 : axle > 0 ? body.dentFront : body.dentBack;
-                float travel = isTruck && body != null
-                        ? lerp(previousSuspension[index], world.suspensionTravel(index), fraction) : 0f;
-                Matrix.translateM(model, 0, side * ((isTruck ? World.TRUCK_WHEEL_X : World.CAR_WHEEL_X) - .14f * bend),
-                        (isTruck ? World.TRUCK_WHEEL_Y : World.CAR_WHEEL_Y)
-                                + travel - (body == null ? 0 : World.WHEEL_DENT_DROP * body.damage),
-                        axle * ((isTruck ? World.TRUCK_WHEEL_Z : World.CAR_WHEEL_Z) - .20f * endDent));
-                float steer = isTruck && axle > 0 && body != null
-                        ? lerp(previousSteering, steeringAngle, fraction) : 0;
+                float travel = body == null ? 0f : lerp(previousSuspension[index], world.suspensionTravel(index), fraction);
+                Matrix.translateM(model, 0, body == null ? side * World.TRUCK_WHEEL_X : body.wheelX(index),
+                        body == null ? World.TRUCK_WHEEL_Y : body.wheelY() + travel,
+                        body == null ? axle * World.TRUCK_WHEEL_Z : body.wheelZ(index));
+                float steer = axle > 0 && body != null ? lerp(previousSteering, steeringAngle, fraction) : 0;
                 Matrix.rotateM(model, 0, steer + side * (bend * 21 + endDent * 7), 0, 1, 0);
                 Matrix.rotateM(model, 0, degrees(wheelSpin), 1, 0, 0);
-                float r = isTruck ? World.TRUCK_WHEEL_RADIUS : World.CAR_WHEEL_RADIUS;
-                Matrix.scaleM(model, 0, isTruck ? World.TRUCK_WHEEL_HALF_WIDTH : World.CAR_WHEEL_HALF_WIDTH, r, r);
-                drawModel(tire);
+                float r = World.TRUCK_WHEEL_RADIUS;
+                Matrix.scaleM(model, 0, World.TRUCK_WHEEL_HALF_WIDTH, r, r);
+                drawModel(truckTire);
             }
         }
     }
@@ -559,18 +578,21 @@ final class GameRenderer implements GLSurfaceView.Renderer {
         if (body == null) return truckMesh(skin, 0, 0, 0, 0, 0, 0);
         int roof = quantize(body.dentRoof), front = quantize(body.dentFront), back = quantize(body.dentBack);
         int left = quantize(body.dentLeft), right = quantize(body.dentRight);
-        int state = ((body.color & 255) << 20) | (roof << 16) | (front << 12) | (back << 8) | (left << 4) | right;
+        int damageState = (roof << 16) | (front << 12) | (back << 8) | (left << 4) | right;
+        int state = ((body.color & 255) << 20) | damageState;
         if (isTruck) return truckMesh(skin, state, front, back, left, right, roof);
-        if (!isTruck && (state & 0xfffff) == 0 && body.color >= 0 && body.color < stock.length) {
-            if (stock[body.color] == null) {
-                Geometry.Mesh mesh = Geometry.vehicle(false, body.color, 0, 0, 0, 0, 0);
-                stock[body.color] = new GpuMesh(mesh.data, mesh.count);
+        if (damageState == 0 && !body.flattened) {
+            int index = body.model.ordinal() * TRAFFIC_COLORS + Math.floorMod(body.color, TRAFFIC_COLORS);
+            if (stock[index] == null) {
+                Geometry.Mesh mesh = TrafficGeometry.mesh(body.model, body.color, 0, 0, 0, 0, 0, false);
+                stock[index] = new GpuMesh(mesh.data, mesh.count);
             }
-            return stock[body.color];
+            return stock[index];
         }
+        if (body.flattened) state |= 1 << 28;
         if (skin.gpu == null || skin.state != state) {
-            Geometry.Mesh mesh = Geometry.vehicle(isTruck, body.color,
-                    front / 15f, back / 15f, left / 15f, right / 15f, roof / 15f);
+            Geometry.Mesh mesh = TrafficGeometry.mesh(body.model, body.color,
+                    front / 15f, back / 15f, left / 15f, right / 15f, roof / 15f, body.flattened);
             if (skin.gpu == null) skin.gpu = new GpuMesh(mesh.data, mesh.count);
             else skin.gpu.upload(mesh.data, mesh.count);
             skin.state = state;
@@ -910,13 +932,12 @@ final class GameRenderer implements GLSurfaceView.Renderer {
             }
             if (detached != 0) {
                 float fx = (float) Math.sin(body.yaw), fz = (float) Math.cos(body.yaw);
-                boolean player = body == world.player;
-                for (int i = 0; i < 4; i++) {
+                for (int i = 0; i < body.axleCount() * 2; i++) {
                     if ((detached & (1 << i)) == 0) continue;
-                    float x = (i < 2 ? -1 : 1) * (player ? World.TRUCK_WHEEL_X : World.CAR_WHEEL_X);
-                    float z = (i % 2 == 0 ? -1 : 1) * (player ? World.TRUCK_WHEEL_Z : World.CAR_WHEEL_Z);
+                    float x = body.wheelX(i);
+                    float z = body.wheelZ(i);
                     for (int j = 0; j < 4; j++) spawnEffect(body.x + x*fz + z*fx,
-                            body.y + (player ? World.TRUCK_WHEEL_Y : World.CAR_WHEEL_Y), body.z - x*fx + z*fz, 0);
+                            body.y + body.wheelY(), body.z - x*fx + z*fz, 0);
                 }
             }
         }
