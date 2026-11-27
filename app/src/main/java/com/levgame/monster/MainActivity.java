@@ -79,6 +79,7 @@ public final class MainActivity extends Activity {
         if (inGarage == enabled) return;
         inGarage = enabled;
         game.buttons = 0;
+        dashboard.cameraPointer = -1;
         surface.queueEvent(() -> game.setGarage(enabled));
         if (!enabled && dashboard.showHintUntil == 0) {
             dashboard.showHintUntil = SystemClock.uptimeMillis() + 9500;
@@ -125,6 +126,7 @@ public final class MainActivity extends Activity {
         private final Button[] models = new Button[MODELS.length];
         private final Button[] colors = new Button[PALETTE.length];
         private final Button[] driveTools = new Button[4];
+        private final Button resetCamera;
         private final Button drive;
 
         GameLayout(Context context) {
@@ -150,6 +152,10 @@ public final class MainActivity extends Activity {
             driveTools[3] = tool("Заново", () -> {
                 game.buttons = 0;
                 surface.queueEvent(game::restart);
+            });
+            resetCamera = tool("Камера ↺", () -> {
+                dashboard.stopCameraDrag = true;
+                surface.queueEvent(game::resetCamera);
             });
             updateSelection();
             updateMode();
@@ -207,6 +213,7 @@ public final class MainActivity extends Activity {
             for (Button button : colors) button.setVisibility(garageVisibility);
             drive.setVisibility(garageVisibility);
             for (Button button : driveTools) button.setVisibility(inGarage ? GONE : VISIBLE);
+            resetCamera.setVisibility(inGarage ? GONE : VISIBLE);
         }
 
         @Override protected void onMeasure(int widthSpec, int heightSpec) {
@@ -230,6 +237,7 @@ public final class MainActivity extends Activity {
                 for (int i = 0; i < driveTools.length; i++) {
                     place(driveTools[i], s, first + i * 99, 18, 93, 54, 15);
                 }
+                place(resetCamera, s, width - 114, 114, 98, 34, 13);
             }
         }
 
@@ -250,6 +258,9 @@ public final class MainActivity extends Activity {
         private final float[] cx = new float[4], cy = new float[4], radius = new float[4];
         private float unit, mapX, mapY, mapR;
         private long showHintUntil;
+        private int cameraPointer = -1;
+        private boolean stopCameraDrag;
+        private float cameraTouchX, cameraTouchY;
 
         Dashboard(Context context) { super(context); }
 
@@ -304,8 +315,11 @@ public final class MainActivity extends Activity {
             if (SystemClock.uptimeMillis() < showHintUntil) {
                 float mid = getWidth()/2f, y = getHeight()-23*s;
                 ink.setColor(0xb8182941);
-                canvas.drawRoundRect(mid-138*s, y-22*s, mid+138*s, y+8*s, 10*s, 10*s, ink);
-                text(canvas, "Стрелки — руль    ▲ газ    ■ тормоз / назад", mid-129*s, y, 12, 0xffe7f7ff);
+                canvas.drawRoundRect(mid-138*s, y-37*s, mid+138*s, y+8*s, 10*s, 10*s, ink);
+                ink.setTextAlign(Paint.Align.CENTER);
+                text(canvas, "Стрелки — руль    ▲ газ    ■ тормоз / назад", mid, y-15*s, 12, 0xffe7f7ff);
+                text(canvas, "Проведите по экрану для осмотра", mid, y, 12, 0xffe7f7ff);
+                ink.setTextAlign(Paint.Align.LEFT);
             }
             postInvalidateDelayed(70);
         }
@@ -405,22 +419,49 @@ public final class MainActivity extends Activity {
             canvas.drawText(value, x, y, ink);
         }
 
+        private int controlAt(float x, float y) {
+            for (int i = 0; i < 4; i++) {
+                float dx = x - cx[i], dy = y - cy[i];
+                if (dx*dx + dy*dy < radius[i]*radius[i]) return 1 << i;
+            }
+            return 0;
+        }
+
         @Override public boolean onTouchEvent(MotionEvent event) {
             if (inGarage) return false;
             int action = event.getActionMasked();
             if (action == MotionEvent.ACTION_CANCEL) {
                 game.buttons = 0;
+                cameraPointer = -1;
                 return true;
             }
             int changed = event.getActionIndex();
+            int changedId = event.getPointerId(changed);
+            if (action == MotionEvent.ACTION_DOWN) cameraPointer = -1;
+            if ((action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN)
+                    && cameraPointer == -1 && controlAt(event.getX(changed), event.getY(changed)) == 0) {
+                cameraPointer = changedId;
+                stopCameraDrag = false;
+                cameraTouchX = event.getX(changed);
+                cameraTouchY = event.getY(changed);
+            }
+            boolean lifted = action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP;
             int mask = 0;
             for (int p = 0; p < event.getPointerCount(); p++) {
-                if (p == changed && (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP)) continue;
-                for (int i = 0; i < 4; i++) {
-                    float dx = event.getX(p) - cx[i], dy = event.getY(p) - cy[i];
-                    if (dx*dx + dy*dy < radius[i]*radius[i]) mask |= 1 << i;
+                if (p == changed && lifted) continue;
+                float x = event.getX(p), y = event.getY(p);
+                if (event.getPointerId(p) != cameraPointer) {
+                    mask |= controlAt(x, y);
+                } else if (!stopCameraDrag && action == MotionEvent.ACTION_MOVE
+                        && (x != cameraTouchX || y != cameraTouchY)) {
+                    float horizontal = (x - cameraTouchX) * .012f / unit;
+                    float vertical = (y - cameraTouchY) * .009f / unit;
+                    cameraTouchX = x;
+                    cameraTouchY = y;
+                    surface.queueEvent(() -> game.rotateCamera(horizontal, vertical));
                 }
             }
+            if (lifted && changedId == cameraPointer) cameraPointer = -1;
             game.buttons = mask;
             invalidate();
             return true;

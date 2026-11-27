@@ -303,14 +303,14 @@ final class Geometry {
     }
 
     static Mesh vehicle(boolean truck, int color, float front, float back, float left,
-                        float right, float damage) {
-        return vehicle(truck, truck ? 0xef3521 : color, 0, front, back, left, right, damage);
+                        float right, float roof) {
+        return vehicle(truck, truck ? 0xef3521 : color, 0, front, back, left, right, roof);
     }
 
     static Mesh vehicle(boolean truck, int tint, int design, float front, float back, float left,
-                        float right, float damage) {
+                        float right, float roof) {
         Builder mesh = new Builder();
-        Deformation shape = new Deformation(truck, design, front, back, left, right, damage);
+        Deformation shape = new Deformation(truck, design, front, back, left, right, roof);
         if (truck) {
             truckChassis(mesh, shape);
             if (shape.utility) utilityTruck(mesh, shape, tint);
@@ -953,9 +953,9 @@ final class Geometry {
         private final float back;
         private final float left;
         private final float right;
-        private final float damage;
+        private final float roof;
 
-        Deformation(boolean truck, int design, float front, float back, float left, float right, float damage) {
+        Deformation(boolean truck, int design, float front, float back, float left, float right, float roof) {
             this.truck = truck;
             utility = truck && design == 1;
             halfWidth = truck ? 1.33f : .94f;
@@ -970,11 +970,11 @@ final class Geometry {
             this.back = unit(back);
             this.left = unit(left);
             this.right = unit(right);
-            this.damage = unit(damage);
+            this.roof = unit(roof);
         }
 
         void apply(float x, float y, float z, float[] out) {
-            if (front == 0 && back == 0 && left == 0 && right == 0 && damage == 0) {
+            if (front == 0 && back == 0 && left == 0 && right == 0 && roof == 0) {
                 out[0] = x;
                 out[1] = y;
                 out[2] = z;
@@ -982,10 +982,13 @@ final class Geometry {
             }
             float nx = x / halfWidth;
             float nz = z / halfLength;
-            float end = unit((Math.abs(nz) - .20f) / .80f);
+            float endStart = truck ? .40f : .20f;
+            float end = unit((Math.abs(nz) - endStart) / (1f - endStart));
             float side = unit((Math.abs(nx) - .23f) / .77f);
-            float localEnd = (z >= 0 ? front : back) * end * end;
-            float localSide = (x >= 0 ? right : left) * side * side;
+            // The hood, bumper and doors can buckle without pulling the upper cabin down.
+            float panelWeight = 1f - smooth((y - beltY) / (roofHeight * .66f));
+            float localEnd = (z >= 0 ? front : back) * end * end * panelWeight;
+            float localSide = (x >= 0 ? right : left) * side * side * panelWeight;
             float acrossImpact = .66f + .34f * unit(.61f - nx * (z >= 0 ? .38f : -.31f));
             float sideImpact = ridge(nz - (x >= 0 ? .18f : -.16f), .87f);
             float panelY = (y - baseY) / (beltY - baseY);
@@ -1000,20 +1003,21 @@ final class Geometry {
                     + halfWidth * .063f * nx * localEnd * endFold;
             out[2] = z - Math.copySign(halfLength * .27f * localEnd * acrossImpact, z)
                     + halfLength * .045f * localSide * sideFold;
-            out[1] = y - (truck ? .115f : .14f) * damage
+            out[1] = y
                     + (beltY - baseY) * localEnd * (.57f * endFold - .26f * acrossImpact)
                     + (beltY - baseY) * localSide * (.20f * sideFold - .15f * sideImpact);
 
             float aboveBelt = unit((y - beltY) / roofHeight);
-            float collapse = unit((damage - .22f) / .78f);
             float roofBowl = ridge(nx + .16f, 1.0f) * ridge(nz - .12f, .57f);
             float roofCrease = ridge(nz + .24f * nx + .12f, .19f);
-            float roofDrop = collapse * (.43f + .49f * roofBowl - .14f * roofCrease)
-                    + .11f * (left + right) + .09f * (front + back);
+            float roofDrop = roof * (.43f + .49f * roofBowl - .14f * roofCrease);
+            if (!truck) {
+                // Cars accumulate roof damage when crushed under the truck, lowering the whole shell.
+                roofDrop += .25f * roof;
+                out[1] -= .14f * roof;
+            }
             out[1] -= roofHeight * aboveBelt * Math.min(.96f, roofDrop);
             out[1] = Math.max(.035f, out[1]);
-            out[0] += halfWidth * .11f * aboveBelt * (left - right);
-            out[2] += halfLength * .07f * aboveBelt * (back - front);
         }
     }
 
